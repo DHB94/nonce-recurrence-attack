@@ -131,10 +131,10 @@ class ECDSANonceRecurrenceAttack:
             self._print_header("TEST DATA GENERATION")
             self._print_info(f"Generated private key (hex): {self.colors.YELLOW}{hex(self.d)}{self.colors.END}")
         
-        # Generate coefficients for recurrence relation
+        # Generate coefficients
         a = [random.randint(1, self.curve.order - 1) for _ in range(self.N - 2)]
         
-        # Generate nonces using the recurrence relation
+        # Generate nonces
         k = [random.randint(1, self.curve.order - 1)]  # First nonce is random
         
         for i in range(self.N - 1):
@@ -148,7 +148,7 @@ class ECDSANonceRecurrenceAttack:
         signatures = []
         
         if self.verbose:
-            self._print_info(f"Generating {self.N} signatures with polynomial recurrence relation...")
+            self._print_info(f"Generating {self.N} signatures...")
         
         for i in range(self.N):
             # Create a unique message for each signature
@@ -204,7 +204,7 @@ class ECDSANonceRecurrenceAttack:
     
     def dpoly(self, n, i, j, h, r, s_inv):
         """
-        Recursively compute the polynomial whose roots include the private key.
+        Recursively compute the polynomial to 0.
         
         Args:
             n: Total number of signatures minus 4
@@ -265,7 +265,7 @@ class ECDSANonceRecurrenceAttack:
         else:
             perms_to_try = all_perms
             if self.verbose:
-                self._print_info(f"Trying all {self.colors.YELLOW}{len(all_perms)}{self.colors.END} permutations")
+                self._print_info(f"Trying {self.colors.YELLOW}{len(all_perms)}{self.colors.END} permutations")
         
         # Try permutations until we find the private key
         for perm_idx, perm in enumerate(perms_to_try):
@@ -297,7 +297,7 @@ class ECDSANonceRecurrenceAttack:
                         if self.verbose:
                             print()  # Clear the progress bar line
                             self._print_success(f"Private key recovered in {elapsed_time:.2f} seconds")
-                            self._print_success(f"Private key (hex): {self.colors.GREEN}{hex(private_key)}{self.colors.END}")
+                            self._print_success(f"Private key: {self.colors.GREEN}{hex(private_key)}{self.colors.END}")
                             self._print_separator()
                         return private_key
             except Exception as e:
@@ -306,7 +306,7 @@ class ECDSANonceRecurrenceAttack:
                 continue
         
         if self.verbose:
-            self._print_error("Attack failed: No valid private key found in the tried permutations.")
+            self._print_error("Attack failed: No valid private key found in the all permutations.")
         return None
     
     def verify_private_key(self, private_key, signatures, h):
@@ -337,7 +337,7 @@ class ECDSANonceRecurrenceAttack:
     
     def run_demo(self):
         """Run a full demonstration of the attack."""
-        self._print_header("ECDSA NONCE RECURRENCE ATTACK DEMONSTRATION", centered=True)
+        self._print_header(" NONCE RECURRENCE ATTACK", centered=True)
         
         # Generate test data
         private_key, public_key, hashes, signatures = self.generate_test_data()
