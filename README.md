@@ -35,7 +35,7 @@ The polynomial degree increases with the complexity of the recurrence relation:
 ### Parameter Setup:
 - Choose an elliptic curve (default is SECP256k1)
 - Generate a random private key d for testing
-- Set N ≥ 4 (number of signatures, determines recurrence complexity)
+- minimum number of signatures required, N ≥ 4 (number of signatures, determines recurrence complexity)
 
 ### Nonce Generation:
 - Generate random coefficients for the recurrence relation
