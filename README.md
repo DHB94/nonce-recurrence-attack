@@ -167,3 +167,6 @@ This attack demonstrates why proper nonce generation is critical for ECDSA secur
 - Nonces must be truly random
 - Deterministic nonce generation (RFC 6979) should be used when true randomness is unreliable
 - Any pattern in nonce generation can lead to private key compromise
+
+**Code written after reading**:
+https://eprint.iacr.org/2023/305 by Marco Macchetti
