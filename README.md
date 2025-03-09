@@ -1,6 +1,6 @@
 # ECDSA Nonce Recurrence Attack: In-Depth Explanation
 
-This code implements a sophisticated attack against ECDSA signatures when the nonces (`k` values) follow a predictable recurrence relation. I'll explain how it works, the mathematical principles behind it, and provide detailed setup instructions.
+This code implements a sophisticated attack against ECDSA signatures when the nonces (`k` values) follow a predictable recurrence relation.
 
 ## Concept Overview
 
