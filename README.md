@@ -138,6 +138,17 @@ Examples include:
 This attack demonstrates the importance of proper nonce generation in ECDSA systems and the dangers of any mathematical relationship between successive signature nonces.
 
 ## Security Implications
+
+- Linear
+![Screenshot 2025-03-09 204922](https://github.com/user-attachments/assets/d1275ece-a3cf-4892-8137-c87215a53131)
+
+- Quadratic
+![Screenshot 2025-03-09 205239](https://github.com/user-attachments/assets/4a87210e-e271-4acf-8755-b27e21144789)
+
+- Cubic
+![Screenshot 2025-03-09 205431](https://github.com/user-attachments/assets/840c9855-b281-4231-85c8-00e449a0c87f)
+ 
+- Higher Degree
 ![Screenshot 2025-03-09 201430](https://github.com/user-attachments/assets/5a10782c-3403-4281-9dcf-ec5d97409436)
 
 
