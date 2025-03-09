@@ -1,162 +1,312 @@
 #!/usr/bin/env sage
 
-from sage.all import GF, PolynomialRing
 import hashlib
-import ecdsa
 import random
+import time
 from itertools import permutations
-
-def separator():
-    print("-" * 150)
-
-
-#####################
-# global parameters #
-#####################
-
-# choose any curve
-usedcurve = ecdsa.curves.SECP256k1
-# usedcurve = ecdsa.curves.NIST521p
-# usedcurve = ecdsa.curves.BRAINPOOLP160r1
-
-print("Selected curve :")
-print(usedcurve.name)
-separator()
-
-# the private key that will be guessed
-g = usedcurve.generator
-d = random.randint(1, usedcurve.order - 1)
-print("TYPES: ", type(g), type(d))
-
-pubkey = ecdsa.ecdsa.Public_key(g, g * d)
-privkey = ecdsa.ecdsa.Private_key(pubkey, d)
-print("Private key (decimal):")
-print(d)
-print("Private key (hexadecimal):")
-print(hex(d))
-separator()
-
-# N = the number of signatures to use, N >= 4
-# the degree of the recurrence relation is N-3
-# the number of unknown coefficients in the recurrence equation is N-2
-# the degree of the final polynomial in d is 1 + Sum_(i=1)^(i=N-3)i
-
-N = 7
-assert N >= 4
-
-############################################################
-# nonces and signature generation with recurrence relation #
-############################################################
-
-# first, we randomly generate the coefficients of the recurrence relation
-a = []
-for i in range(N-2):
-    a.append(random.randint(1, usedcurve.order - 1))
-
-# then, we generate the N nonces
-k = []
-# the first one is random
-k.append(random.randint(1, usedcurve.order - 1))
-# the other ones are computed with the recurrence equation
-for i in range(N-1):
-    new_k = 0
-    for j in range(N-2):
-        new_k += a[j] * (k[i] ** j) % usedcurve.order
-    k.append(new_k)
-
-# then, we generate the signatures using the nonces
-h = []
-sgns = []
-for i in range(N):
-    digest_fnc = hashlib.new("sha256")
-    digest_fnc.update(b"recurrence test ")
-    digest_fnc.update(i.to_bytes(1, 'big'))
-    h.append(digest_fnc.digest())
-    # get hash values as integers and comply with ECDSA
-    if usedcurve.order.bit_length() < 256:
-        h[i] = (int.from_bytes(h[i], "big") >> (256 - usedcurve.order.bit_length())) % usedcurve.order
-    else:
-        h[i] = int.from_bytes(h[i], "big") % usedcurve.order
-    sgns.append(privkey.sign(h[i], k[i]))
-
-# get signature parameters as arrays
-s = [sgn.s for sgn in sgns]
-r = [sgn.r for sgn in sgns]
-s_inv = [ecdsa.numbertheory.inverse_mod(s[i], usedcurve.order) for i in range(N)]
+from sage.all import GF, PolynomialRing
+import ecdsa
 
 
-#########################################
-# generating the private-key polynomial #
-#########################################
-
-# declaring stuff for manipulating polynomials with SAGE
-Z = GF(usedcurve.order)
-R = PolynomialRing(Z, names=('dd',))
-(dd,) = R._first_ngens(1)
-
-# the polynomial we construct will have degree 1 + Sum_(i=1)^(i=N-3)i in dd
-# our task here is to compute this polynomial in a constructive way starting from the N signatures in the given list order
-# the generic formula will be given in terms of differences of nonces, i.e. k_ij = k_i - k_j where i and j are the signature indexes
-# each k_ij is a first-degree polynomial in dd
-# this function has the goal of returning it given i and j
-def k_ij_poly(i, j, h, r, s_inv):
-    hi = Z(h[i])
-    hj = Z(h[j])
-    s_invi = Z(s_inv[i])
-    s_invj = Z(s_inv[j])
-    ri = Z(r[i])
-    rj = Z(r[j])
-    poly = dd * (ri * s_invi - rj * s_invj) + hi * s_invi - hj * s_invj
-    return poly
-
-# the idea is to compute the polynomial recursively from the given degree down to 0
-# the algorithm is as follows:
-# for 4 signatures the second degree polynomial is:
-# k_12*k_12 - k_23*k_01
-# so we can compute its coefficients.
-# the polynomial for N signatures has degree 1 + Sum_(i=1)^(i=N-3)i and can be derived from the one for N-1 signatures
-
-# let's define dpoly(i, j) recursively as the dpoly of degree i starting with index j
-def dpoly(n, i, j, h, r, s_inv):
-    if i == 0:
-        return (k_ij_poly(j + 1, j + 2, h, r, s_inv)) * (k_ij_poly(j + 1, j + 2, h, r, s_inv)) - (k_ij_poly(j + 2, j + 3, h, r, s_inv)) * (k_ij_poly(j + 0, j + 1, h, r, s_inv))
-    else:
-        left = dpoly(n, i - 1, j, h, r, s_inv)
-        for m in range(1, i + 2):
-            left = left * (k_ij_poly(j + m, j + i + 2, h, r, s_inv))
-        right = dpoly(n, i - 1, j + 1, h, r, s_inv)
-        for m in range(1, i + 2):
-            right = right * (k_ij_poly(j, j + m, h, r, s_inv))
-        return (left - right)
-
-# function to solve for the private key given a specific permutation of signatures
-def solve_for_private_key(h_perm, r_perm, s_perm, s_inv_perm):
-    poly_target = dpoly(N - 4, N - 4, 0, h_perm, r_perm, s_inv_perm)
-    d_guesses = poly_target.roots()
-    for root, multiplicity in d_guesses:
-        if int(root) == d:  # Convert IntegerMod to int for comparison
-            return int(root)  # Convert IntegerMod to int for multiplication
-    return None
-
-# try all permutations of the signatures
-perms = permutations(range(N))
-for perm in perms:
-    h_perm = [h[i] for i in perm]
-    r_perm = [r[i] for i in perm]
-    s_perm = [s[i] for i in perm]
-    s_inv_perm = [s_inv[i] for i in perm]
-
-    print(f"\nTrying permutation: {perm}")
-    result = solve_for_private_key(h_perm, r_perm, s_perm, s_inv_perm)
-    if result is not None:
-        print(f"Private key found (decimal): {result}")
-        print(f"Private key found (hexadecimal): {hex(result)}")
+class ECDSANonceRecurrenceAttack:
+    """
+    Implementation of an attack against ECDSA signatures when nonces follow
+    a predictable polynomial recurrence relation.
+    """
+    
+    def __init__(self, curve=ecdsa.curves.SECP256k1, signatures_count=7, verbose=True):
+        """
+        Initialize the ECDSA attack with specified parameters.
         
-        # Compute the public key from the private key
-        pubkey_point = result * g  # result is now a standard Python int
-        print("Computed public key (x, y):")
-        print(f"x = {pubkey_point.x()} (0x{pubkey_point.x():x})")
-        print(f"y = {pubkey_point.y()} (0x{pubkey_point.y():x})")
-        break
-else:
-    print("No valid private key found in all permutations.")
+        Args:
+            curve: The elliptic curve to use (default: SECP256k1)
+            signatures_count: Number of signatures to use (N >= 4)
+            verbose: Whether to print detailed information
+        """
+        self.curve = curve
+        self.N = signatures_count
+        self.verbose = verbose
+        
+        # Validate parameters
+        if self.N < 4:
+            raise ValueError("Number of signatures must be at least 4")
+            
+        # Initialize field and polynomial ring for later use
+        self.Z = GF(self.curve.order)
+        self.R = PolynomialRing(self.Z, names=('dd',))
+        (self.dd,) = self.R._first_ngens(1)
+        
+        if self.verbose:
+            self._print_attack_info()
+    
+    def _print_attack_info(self):
+        """Print information about the attack configuration."""
+        self._print_separator()
+        print(f"ECDSA Nonce Recurrence Attack")
+        print(f"Selected curve: {self.curve.name}")
+        print(f"Number of signatures (N): {self.N}")
+        print(f"Recurrence relation degree: {self.N - 3}")
+        print(f"Final polynomial degree: {self._calculate_final_polynomial_degree()}")
+        self._print_separator()
+    
+    def _calculate_final_polynomial_degree(self):
+        """Calculate the degree of the final polynomial in d."""
+        return 1 + sum(range(1, self.N - 2))
+    
+    def _print_separator(self):
+        """Print a visual separator line."""
+        print("-" * 100)
+    
+    def generate_test_data(self):
+        """
+        Generate test data including private key, nonces with recurrence relation,
+        and corresponding ECDSA signatures.
+        
+        Returns:
+            tuple: (private_key, public_key, hashes, signatures)
+        """
+        # Generate private key
+        g = self.curve.generator
+        self.d = random.randint(1, self.curve.order - 1)
+        
+        pubkey = ecdsa.ecdsa.Public_key(g, g * self.d)
+        privkey = ecdsa.ecdsa.Private_key(pubkey, self.d)
+        
+        if self.verbose:
+            print("Generated private key (hex):", hex(self.d))
+            self._print_separator()
+        
+        # Generate coefficients for recurrence relation
+        a = [random.randint(1, self.curve.order - 1) for _ in range(self.N - 2)]
+        
+        # Generate nonces using the recurrence relation
+        k = [random.randint(1, self.curve.order - 1)]  # First nonce is random
+        
+        for i in range(self.N - 1):
+            new_k = 0
+            for j in range(self.N - 2):
+                new_k += a[j] * pow(k[i], j, self.curve.order) % self.curve.order
+            k.append(new_k % self.curve.order)
+        
+        # Generate signatures using the nonces
+        h = []
+        signatures = []
+        
+        for i in range(self.N):
+            # Create a unique message for each signature
+            digest_fnc = hashlib.sha256()
+            digest_fnc.update(f"ECDSA recurrence attack test {i}".encode('utf-8'))
+            msg_hash = digest_fnc.digest()
+            
+            # Adjust hash to fit curve order
+            if self.curve.order.bit_length() < 256:
+                hash_int = (int.from_bytes(msg_hash, "big") >> 
+                           (256 - self.curve.order.bit_length())) % self.curve.order
+            else:
+                hash_int = int.from_bytes(msg_hash, "big") % self.curve.order
+                
+            h.append(hash_int)
+            signatures.append(privkey.sign(hash_int, k[i]))
+        
+        # Extract signature components
+        r = [sig.r for sig in signatures]
+        s = [sig.s for sig in signatures]
+        
+        if self.verbose:
+            print(f"Generated {self.N} signatures with polynomial recurrence relation")
+            print(f"Coefficients of recurrence: {a}")
+            self._print_separator()
+        
+        return self.d, pubkey, h, signatures
+    
+    def k_ij_poly(self, i, j, h, r, s_inv):
+        """
+        Calculate the k_ij polynomial (k_i - k_j) as a function of the private key.
+        
+        Args:
+            i, j: Signature indices
+            h: Array of message hashes
+            r: Array of r values from signatures
+            s_inv: Array of modular inverses of s values
+            
+        Returns:
+            A polynomial in dd representing k_i - k_j
+        """
+        hi = self.Z(h[i])
+        hj = self.Z(h[j])
+        s_invi = self.Z(s_inv[i])
+        s_invj = self.Z(s_inv[j])
+        ri = self.Z(r[i])
+        rj = self.Z(r[j])
+        
+        # k_ij = (dd * (ri * s_invi - rj * s_invj) + hi * s_invi - hj * s_invj)
+        return self.dd * (ri * s_invi - rj * s_invj) + hi * s_invi - hj * s_invj
+    
+    def dpoly(self, n, i, j, h, r, s_inv):
+        """
+        Recursively compute the polynomial whose roots include the private key.
+        
+        Args:
+            n: Total number of signatures minus 4
+            i: Current recursion depth
+            j: Starting index
+            h, r, s_inv: Signature data arrays
+            
+        Returns:
+            The polynomial whose roots contain the private key
+        """
+        # Base case: second-degree polynomial for 4 signatures
+        if i == 0:
+            k12 = self.k_ij_poly(j + 1, j + 2, h, r, s_inv)
+            k23 = self.k_ij_poly(j + 2, j + 3, h, r, s_inv)
+            k01 = self.k_ij_poly(j + 0, j + 1, h, r, s_inv)
+            return k12 * k12 - k23 * k01
+        
+        # Recursive case: build higher degree polynomials
+        left = self.dpoly(n, i - 1, j, h, r, s_inv)
+        for m in range(1, i + 2):
+            left *= self.k_ij_poly(j + m, j + i + 2, h, r, s_inv)
+            
+        right = self.dpoly(n, i - 1, j + 1, h, r, s_inv)
+        for m in range(1, i + 2):
+            right *= self.k_ij_poly(j, j + m, h, r, s_inv)
+            
+        return left - right
+    
+    def attack(self, h, signatures, max_permutations=None):
+        """
+        Execute the attack to recover the private key.
+        
+        Args:
+            h: Array of message hashes
+            signatures: Array of ECDSA signatures
+            max_permutations: Maximum number of permutations to try (None for all)
+            
+        Returns:
+            The recovered private key or None if not found
+        """
+        start_time = time.time()
+        
+        # Extract signature components
+        r = [sig.r for sig in signatures]
+        s = [sig.s for sig in signatures]
+        s_inv = [ecdsa.numbertheory.inverse_mod(sig.s, self.curve.order) for sig in signatures]
+        
+        # Get permutations to try
+        indices = list(range(self.N))
+        all_perms = list(permutations(indices))
+        
+        if max_permutations is not None and max_permutations < len(all_perms):
+            perms_to_try = random.sample(all_perms, max_permutations)
+            if self.verbose:
+                print(f"Trying {max_permutations} random permutations out of {len(all_perms)} possible")
+        else:
+            perms_to_try = all_perms
+            if self.verbose:
+                print(f"Trying all {len(all_perms)} permutations")
+        
+        # Try permutations until we find the private key
+        for perm_idx, perm in enumerate(perms_to_try):
+            if self.verbose and perm_idx % 10 == 0:
+                print(f"Trying permutation {perm_idx + 1}/{len(perms_to_try)}: {perm}")
+            
+            h_perm = [h[i] for i in perm]
+            r_perm = [r[i] for i in perm]
+            s_perm = [s[i] for i in perm]
+            s_inv_perm = [s_inv[i] for i in perm]
+            
+            # Construct the polynomial and find its roots
+            try:
+                poly = self.dpoly(self.N - 4, self.N - 4, 0, h_perm, r_perm, s_inv_perm)
+                roots = poly.roots()
+                
+                # Check if any root matches the private key
+                for root, _ in roots:
+                    private_key = int(root)
+                    if self.verify_private_key(private_key, signatures, h):
+                        elapsed_time = time.time() - start_time
+                        if self.verbose:
+                            print(f"\nSuccess! Private key recovered in {elapsed_time:.2f} seconds")
+                            print(f"Private key (hex): {hex(private_key)}")
+                            self._print_separator()
+                        return private_key
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error in permutation {perm}: {str(e)}")
+                continue
+        
+        if self.verbose:
+            print("Attack failed: No valid private key found in the tried permutations.")
+        return None
+    
+    def verify_private_key(self, private_key, signatures, h):
+        """
+        Verify if a private key candidate is correct by checking signatures.
+        
+        Args:
+            private_key: The private key candidate
+            signatures: The signatures to verify
+            h: The message hashes
+            
+        Returns:
+            True if the private key is valid, False otherwise
+        """
+        g = self.curve.generator
+        pubkey_point = private_key * g
+        pubkey = ecdsa.ecdsa.Public_key(g, pubkey_point)
+        
+        # Check if we can verify at least one signature
+        for i, sig in enumerate(signatures):
+            try:
+                if pubkey.verifies(h[i], sig):
+                    return True
+            except:
+                continue
+                
+        return False
+    
+    def run_demo(self):
+        """Run a full demonstration of the attack."""
+        print("Running ECDSA nonce recurrence attack demonstration")
+        
+        # Generate test data
+        private_key, public_key, hashes, signatures = self.generate_test_data()
+        
+        # Run the attack
+        recovered_key = self.attack(hashes, signatures)
+        
+        # Verify the result
+        if recovered_key is not None and recovered_key == private_key:
+            print("Attack successful!")
+            
+            # Calculate public key from recovered private key
+            g = self.curve.generator
+            pubkey_point = recovered_key * g
+            print("\nComputed public key (x, y):")
+            print(f"x = {pubkey_point.x():x}")
+            print(f"y = {pubkey_point.y():x}")
+        else:
+            print("Attack failed.")
+        
+        return recovered_key
+
+
+# Main execution code
+if __name__ == "__main__":
+    # You can customize these parameters directly in the code
+    curve = ecdsa.curves.SECP256k1
+    # curve = ecdsa.curves.NIST521p
+    # curve = ecdsa.curves.BRAINPOOLP160r1
+    
+    # Number of signatures to use (minimum signature required, N >= 4)
+    signatures_count = 7
+    
+    # Create and run the attack
+    attack = ECDSANonceRecurrenceAttack(
+        curve=curve,
+        signatures_count=signatures_count,
+        verbose=True
+    )
+    
+    # Run the full demonstration
+    attack.run_demo()
