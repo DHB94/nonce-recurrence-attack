@@ -149,7 +149,8 @@ This attack demonstrates the importance of proper nonce generation in ECDSA syst
 ![Screenshot 2025-03-09 205431](https://github.com/user-attachments/assets/840c9855-b281-4231-85c8-00e449a0c87f)
  
 - Higher Degree
-![Screenshot 2025-03-09 201430](https://github.com/user-attachments/assets/5a10782c-3403-4281-9dcf-ec5d97409436)
+![Screenshot 2025-03-09 205703](https://github.com/user-attachments/assets/a1a9bc02-cf68-427b-83ac-2fd2f390d8f5)
+
 
 
 ### Polynomial Recurrence Vulnerabilities
