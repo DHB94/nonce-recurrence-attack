@@ -130,8 +130,47 @@ This attack can be applied to any ECDSA implementation where:
 1. Multiple signatures are available
 2. The nonces follow a predictable pattern
 3. The recurrence relation coefficients can be identified
+4. Algorithmic RNG:
+A system uses a polynomial congruential generator for nonce generation
+Such generators follow exactly the kind of recurrence relation exploited here
+State Reuse:
+A system that updates internal state polynomially between signature operations
+Each signature's nonce is derived from this evolving state
+Custom ECDSA Implementations:
+Non-standard implementations that attempt to create their own nonce generation
+Especially vulnerable if they use mathematical formulas to update nonce state
+This attack demonstrates the importance of proper nonce generation in ECDSA systems and the dangers of any mathematical relationship between successive signature nonces.
 
 ## Security Implications
+
+Polynomial Recurrence Vulnerabilities
+
+Linear Recurrence (N=4):
+
+If nonces follow a pattern: k_i+1 = a_0 + a_1*k_i
+Only 4 signatures needed to recover the private key
+Produces a quadratic equation easily solvable for the private key
+
+
+Quadratic Recurrence (N=5):
+
+If nonces follow a pattern: k_i+1 = a_0 + a_1k_i + a_2k_i²
+Requires 5 signatures
+Results in a 4th-degree polynomial with the private key as a root
+
+
+Higher Degree Recurrences:
+
+The attack scales to any polynomial recurrence relation
+Each additional degree requires one more signature
+Computational complexity increases with degree, but remains feasible
+
+
+Unknown Coefficients:
+
+The attack doesn't require knowing the coefficients of the recurrence relation
+It only requires that such a relation exists
+This makes the attack particularly powerful against systematic nonce generation
 
 This attack demonstrates why proper nonce generation is critical for ECDSA security:
 - Nonces must be truly random
