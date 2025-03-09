@@ -138,6 +138,8 @@ Examples include:
 This attack demonstrates the importance of proper nonce generation in ECDSA systems and the dangers of any mathematical relationship between successive signature nonces.
 
 ## Security Implications
+![Screenshot 2025-03-09 201430](https://github.com/user-attachments/assets/5a10782c-3403-4281-9dcf-ec5d97409436)
+
 
 ### Polynomial Recurrence Vulnerabilities
 
