@@ -181,5 +181,5 @@ This attack demonstrates why proper nonce generation is critical for ECDSA secur
 - Any pattern in nonce generation can lead to private key compromise
 
 Code written after reading the theory of:
-- https://eprint.iacr.org/2023/305
+-  https://eprint.iacr.org/2023/305.pdf
 -  Marco Macchetti , Kudelski Security. 
