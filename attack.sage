@@ -67,7 +67,7 @@ class ECDSANonceRecurrenceAttack:
         self._print_info(f"Selected curve: {self.colors.BOLD}{self.curve.name}{self.colors.END}")
         self._print_info(f"Number of signatures (N): {self.colors.BOLD}{self.N}{self.colors.END}")
         self._print_info(f"Recurrence relation degree: {self.colors.BOLD}{self.N - 3}{self.colors.END}")
-        self._print_info(f"Final polynomial degree: {self.colors.BOLD}{self._calculate_final_polynomial_degree()}{self.colors.END}")
+        self._print_info(f"Final polynomial degree: {self.colors.BOLD}{int(self._calculate_final_polynomial_degree())}{self.colors.END}")  # Convert to int
         
         # Add information about how the attack works without knowing coefficients
         self._print_info(f"{self.colors.BOLD}Attack properties:{self.colors.END}")
@@ -114,7 +114,8 @@ class ECDSANonceRecurrenceAttack:
     
     def _print_progress(self, current, total, prefix="Progress", length=50):
         """Print a progress bar."""
-        percent = (current / total) * 100
+        # Convert to Python float to avoid SageMath Rational formatting issues
+        percent = float((current / total) * 100)
         filled_length = int(length * current // total)
         bar = "█" * filled_length + "░" * (length - filled_length)
         
@@ -139,7 +140,7 @@ class ECDSANonceRecurrenceAttack:
         
         if self.verbose:
             self._print_header("TEST DATA GENERATION")
-            self._print_info(f"Generated private key (hex): {self.colors.YELLOW}{hex(self.d)}{self.colors.END}")
+            self._print_info(f"Generated private key (hex): {self.colors.YELLOW}{hex(int(self.d))}{self.colors.END}")  # Convert to int
         
         # Generate coefficients for recurrence relation
         a = [random.randint(1, self.curve.order - 1) for _ in range(self.N - 2)]
@@ -185,7 +186,9 @@ class ECDSANonceRecurrenceAttack:
         s = [sig.s for sig in signatures]
         
         if self.verbose:
-            self._print_info(f"[TEST DATA ONLY] Recurrence coefficients: {self.colors.YELLOW}{a}{self.colors.END}")
+            # Make sure to convert any SageMath types to Python types for formatting
+            a_display = [int(coef) for coef in a]  # Convert coefficients to int
+            self._print_info(f"[TEST DATA ONLY] Recurrence coefficients: {self.colors.YELLOW}{a_display}{self.colors.END}")
             self._print_info(f"{self.colors.BOLD}Note:{self.colors.END} These coefficients are {self.colors.RED}NOT{self.colors.END} used in the attack.")
             self._print_info(f"      Real attacks would have no knowledge of these values.")
             self._print_separator()
@@ -293,10 +296,10 @@ class ECDSANonceRecurrenceAttack:
             if self.verbose:
                 self._print_progress(perm_idx + 1, len(perms_to_try), prefix="Testing Permutations")
                 if perm_idx % 10 == 0 and perm_idx > 0:
-                    elapsed = time.time() - start_time
-                    rate = perm_idx / elapsed
-                    estimated_total = len(perms_to_try) / rate if rate > 0 else 0
-                    remaining = max(0, estimated_total - elapsed)
+                    elapsed = float(time.time() - start_time)  # Convert to Python float
+                    rate = float(perm_idx / elapsed) if elapsed > 0 else 0  # Convert to Python float
+                    estimated_total = float(len(perms_to_try) / rate) if rate > 0 else 0  # Convert to Python float
+                    remaining = max(0, float(estimated_total - elapsed))  # Convert to Python float
                     self._print_info(f"Permutation {perm_idx}/{len(perms_to_try)}: {self.colors.YELLOW}{perm}{self.colors.END}")
                     self._print_info(f"Time elapsed: {elapsed:.2f}s | Est. remaining: {remaining:.2f}s")
             
@@ -312,9 +315,9 @@ class ECDSANonceRecurrenceAttack:
                 
                 # Check if any root matches the private key
                 for root, _ in roots:
-                    private_key = int(root)
+                    private_key = int(root)  # Convert to int
                     if self.verify_private_key(private_key, signatures, h):
-                        elapsed_time = time.time() - start_time
+                        elapsed_time = float(time.time() - start_time)  # Convert to Python float
                         if self.verbose:
                             print()  # Clear the progress bar line
                             self._print_success(f"Private key recovered in {elapsed_time:.2f} seconds")
@@ -383,8 +386,11 @@ class ECDSANonceRecurrenceAttack:
             pubkey_point = recovered_key * g
             
             self._print_info(f"Computed public key (x, y):")
-            print(f"{self.colors.CYAN}x = {self.colors.YELLOW}{pubkey_point.x():x}{self.colors.END}")
-            print(f"{self.colors.CYAN}y = {self.colors.YELLOW}{pubkey_point.y():x}{self.colors.END}")
+            # Convert SageMath types to Python types for formatting
+            x_coord = int(pubkey_point.x()) if hasattr(pubkey_point.x(), 'integer_representation') else pubkey_point.x()
+            y_coord = int(pubkey_point.y()) if hasattr(pubkey_point.y(), 'integer_representation') else pubkey_point.y()
+            print(f"{self.colors.CYAN}x = {self.colors.YELLOW}{x_coord:x}{self.colors.END}")
+            print(f"{self.colors.CYAN}y = {self.colors.YELLOW}{y_coord:x}{self.colors.END}")
             
             return recovered_key
         else:
