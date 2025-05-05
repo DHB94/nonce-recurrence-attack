@@ -107,7 +107,7 @@ The polynomial degree increases with the complexity of the recurrence relation:
 
 3. Run the script:
    ```
-   sage nonce_attack.sage
+   sage attack.sage
    ```
 
 ## Customizing the Attack
