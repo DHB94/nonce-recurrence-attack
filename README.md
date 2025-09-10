@@ -182,4 +182,5 @@ This attack demonstrates why proper nonce generation is critical for ECDSA secur
 
 Code written after reading the theory of:
 -  https://eprint.iacr.org/2023/305.pdf
--  Marco Macchetti , Kudelski Security. 
+-  Marco Macchetti, Principal Cryptographer at Kudelski Security
+-  Nils Amiet , Lead Prototyping Engineer at Kudelski Security
