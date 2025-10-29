@@ -16,14 +16,5 @@
       "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
     ],
     "swapFeeBps": 30
-  },
-  {
-    "name": "Balancer 50 WBTC 50 WETH",
-    "poolId": "0x03cd157746c61f44597d02ecdbe60a83af69933c000200000000000000000000",
-    "tokens": [
-      "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6",
-      "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"
-    ],
-    "swapFeeBps": 30
   }
 ]
