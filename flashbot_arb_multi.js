@@ -321,7 +321,7 @@ async function deploy(force) {
   }
   console.log("🚀 Deploying FlashBotArb...");
   const factory = new ethers.ContractFactory(abi, bytecode, wallet);
-  const balancerAddr = BALANCER_VAULT.address;
+  const balancerAddr = process.env.BALANCER_VAULT_ADDRESS || "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
   const flashBot = await factory.deploy(process.env.AAVE_POOL_ADDRESSES_PROVIDER, balancerAddr);
   await flashBot.waitForDeployment();
   const deployedAddress = await flashBot.getAddress();
