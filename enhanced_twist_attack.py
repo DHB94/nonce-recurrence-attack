@@ -461,18 +461,16 @@ class EnhancedTwistAttack:
         """Save results to a JSON file with proper integer serialization."""
 
         results = {
-            "public_key": tuple(self._convert_to_python(x) for x in self.public_key)
-            if self.public_key
-            else None,
+            "public_key": self.public_key,
             "bitcoin_address": self.bitcoin_address,
             "parameters": {
-                "threshold": self._convert_to_python(self.threshold),
+                "threshold": self.threshold,
                 "max_twists": self.max_twists,
                 "num_curves": len(self.curves),
             },
             "results": self._convert_to_python(self.results),
-            "runtime_stats": self._convert_to_python(self.runtime_stats),
-            "partial_keys": self._convert_to_python(self.partial_keys),
+            "runtime_stats": self.runtime_stats,
+            "partial_keys": self.partial_keys,
             "valid_curves": self.valid_curves,
             "success": self.results.get("verification", False),
             "bitcoin_success": self.results.get("bitcoin_verification", False),
