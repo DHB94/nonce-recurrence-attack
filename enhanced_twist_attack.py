@@ -58,7 +58,7 @@ class EnhancedTwistAttack:
         self.max_twists = max_twists
         self.max_workers = max_workers
         self.curves: Dict[str, EllipticCurve] = {}
-        self._cache: Dict[str, Dict[str, int]] = {}
+        self._cache: Dict[str, Dict[str, object]] = {}
 
         # Initialize curves
         self.initialize_curves()
