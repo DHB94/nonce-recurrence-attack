@@ -58,7 +58,7 @@ class EnhancedTwistAttack:
         self.max_twists = max_twists
         self.max_workers = max_workers
         self.curves: Dict[str, EllipticCurve] = {}
-        self._cache: Dict[str, Dict[str, int]] = {}
+        self._cache: Dict[str, Dict[str, object]] = {}
 
         # Initialize curves
         self.initialize_curves()
@@ -304,10 +304,7 @@ class EnhancedTwistAttack:
             self.valid_curves.append(curve_name)
 
             Q = (pubx, Qy)
-            partial_keys = []
-            for dlog, subgroup_order in self.find_partial_keys(curve, Q, small_subgroups):
-                if self.verify_partial_key(curve, Q, dlog, subgroup_order):
-                    partial_keys.append((int(dlog), int(subgroup_order)))
+            partial_keys = self.find_partial_keys(curve, Q, small_subgroups)
 
             analysis["partial_keys"] = partial_keys
             self.partial_keys.extend(partial_keys)
@@ -464,18 +461,16 @@ class EnhancedTwistAttack:
         """Save results to a JSON file with proper integer serialization."""
 
         results = {
-            "public_key": tuple(self._convert_to_python(x) for x in self.public_key)
-            if self.public_key
-            else None,
+            "public_key": self.public_key,
             "bitcoin_address": self.bitcoin_address,
             "parameters": {
-                "threshold": self._convert_to_python(self.threshold),
+                "threshold": self.threshold,
                 "max_twists": self.max_twists,
                 "num_curves": len(self.curves),
             },
             "results": self._convert_to_python(self.results),
-            "runtime_stats": self._convert_to_python(self.runtime_stats),
-            "partial_keys": self._convert_to_python(self.partial_keys),
+            "runtime_stats": self.runtime_stats,
+            "partial_keys": self.partial_keys,
             "valid_curves": self.valid_curves,
             "success": self.results.get("verification", False),
             "bitcoin_success": self.results.get("bitcoin_verification", False),
