@@ -304,10 +304,7 @@ class EnhancedTwistAttack:
             self.valid_curves.append(curve_name)
 
             Q = (pubx, Qy)
-            partial_keys = []
-            for dlog, subgroup_order in self.find_partial_keys(curve, Q, small_subgroups):
-                if self.verify_partial_key(curve, Q, dlog, subgroup_order):
-                    partial_keys.append((int(dlog), int(subgroup_order)))
+            partial_keys = self.find_partial_keys(curve, Q, small_subgroups)
 
             analysis["partial_keys"] = partial_keys
             self.partial_keys.extend(partial_keys)
