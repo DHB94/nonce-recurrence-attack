@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Balancer 50 WMATIC 50 WETH",
+    "poolId": "0x6cfaf40300aa32fa1a3c453f1a6b3ad72037a4af000200000000000000000000",
+    "tokens": [
+      "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270",
+      "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"
+    ],
+    "swapFeeBps": 30
+  },
+  {
+    "name": "Balancer 50 WETH 50 USDC",
+    "poolId": "0x8159462d255c1d24915cb51ec361f700174cd994000200000000000000000000",
+    "tokens": [
+      "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619",
+      "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+    ],
+    "swapFeeBps": 30
+  }
+]
