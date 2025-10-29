@@ -166,6 +166,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase, IBalancerFlashLoanRecip
     }
 
     function executeOperation(address[] calldata assets,uint256[] calldata amounts,uint256[] calldata premiums,address,bytes calldata) external override returns (bool) {
+        require(msg.sender == address(POOL), "invalid sender");
         address asset = assets[0]; uint256 amount = amounts[0];
         _processLoan(asset, amount, premiums[0], address(POOL), true);
         return true;
