@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Any, Tuple
 import base58
 import random
 import signal
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation
 
 # ----------------------------------------------------------------------
 # CONFIG & LOGGING
@@ -70,15 +70,16 @@ class Statistics:
         self.rbf_txs_found = 0
         self.successful_sweeps = 0
         self.total_profit_sat = 0
+        self.processed_txs = 0
 
-    def record_checked(self):
+    def update(self, is_rbf=False, success=False, profit_sat=0):
         self.total_txs_checked += 1
-
-    def record_rbf(self, success: bool = False, profit_sat: int = 0):
-        self.rbf_txs_found += 1
+        if is_rbf:
+            self.rbf_txs_found += 1
         if success:
             self.successful_sweeps += 1
             self.total_profit_sat += profit_sat
+        self.processed_txs += 1
 
     def get_stats(self):
         runtime = time.time() - self.start_time
@@ -91,7 +92,7 @@ class Statistics:
             "successful_sweeps": self.successful_sweeps,
             "total_profit_sat": self.total_profit_sat,
             "profit_per_hour_sat": self.total_profit_sat / runtime_hours if runtime_hours > 0 else 0,
-            "txs_per_hour": self.total_txs_checked / runtime_hours * 3600 if runtime_hours > 0 else 0,
+            "txs_per_hour": self.processed_txs / runtime_hours * 3600 if runtime_hours > 0 else 0,
             "rbf_per_hour": self.rbf_txs_found / runtime_hours * 3600 if runtime_hours > 0 else 0
         }
 
@@ -115,16 +116,6 @@ class BitcoinUtils:
         decoded = BitcoinUtils.base58_decode(addr)
         return b'\x76\xa9\x14' + decoded[1:-4] + b'\x88\xac'
 
-    @staticmethod
-    def encode_varint(value: int) -> bytes:
-        if value < 0xfd:
-            return value.to_bytes(1, "little")
-        if value <= 0xffff:
-            return b"\xfd" + value.to_bytes(2, "little")
-        if value <= 0xffffffff:
-            return b"\xfe" + value.to_bytes(4, "little")
-        return b"\xff" + value.to_bytes(8, "little")
-
 # ----------------------------------------------------------------------
 # RBF EXPLOITER
 # ----------------------------------------------------------------------
@@ -143,20 +134,13 @@ class RBFSweeper:
     @staticmethod
     def _btc_to_sat(value: Any) -> Optional[int]:
         """Convert a BTC value (possibly negative) into satoshis."""
-        if value is None or isinstance(value, bool):
+        if value is None:
             return None
-        if isinstance(value, int):
-            return abs(value)
         try:
             dec_value = Decimal(str(value))
         except (InvalidOperation, TypeError, ValueError):
             return None
-        scaled = (dec_value.copy_abs() * SAT_PER_BTC)
-        try:
-            quantized = scaled.quantize(Decimal("1"), rounding=ROUND_DOWN)
-        except InvalidOperation:
-            return None
-        return int(quantized)
+        return int((dec_value.copy_abs() * SAT_PER_BTC).to_integral_value())
 
     @staticmethod
     def _is_replaceable(flag: Any) -> bool:
@@ -296,13 +280,11 @@ class RBFSweeper:
             if self.shutdown_flag:
                 break
             self._delay()
-            self.stats.record_checked()
+            self.stats.update()
             txid = entry["txid"]
             mempool_info = entry.get("mempool_info")
-            if mempool_info:
-                replaceable_flag = mempool_info.get("bip125-replaceable")
-                if replaceable_flag is not None and not self._is_replaceable(replaceable_flag):
-                    continue
+            if not self._is_replaceable(mempool_info.get("bip125-replaceable")):
+                continue
             result = self.check_rbf_status(txid, mempool_info)
             if result:
                 rbf_txs.append(result)
@@ -347,31 +329,8 @@ class RBFSweeper:
 
             original_fee = tx_data.get("fee", 0)
             total_output = tx_data.get("value", 0)
+            total_in = total_output + original_fee
             vsize = tx_data.get("vsize") or 180
-
-            input_total = 0
-            for txin in vin_entries:
-                prevout = txin.get("prevout")
-                if not prevout:
-                    log.warning("Missing prevout data; cannot determine input value")
-                    return None
-                prev_value_sat = self._btc_to_sat(prevout.get("value"))
-                if prev_value_sat is None:
-                    log.warning("Invalid prevout value; skipping transaction")
-                    return None
-                input_total += prev_value_sat
-
-            if input_total <= 0:
-                log.warning("Total input value is zero; skipping")
-                return None
-
-            if not original_fee:
-                original_fee = input_total - total_output
-                if original_fee <= 0:
-                    log.warning("Unable to determine original fee; skipping")
-                    return None
-
-            total_in = input_total
 
             target_fee = max(fee_rate * vsize, original_fee + 1000)
             if target_fee >= total_in:
@@ -390,20 +349,16 @@ class RBFSweeper:
                 prev_hash = bytes.fromhex(txin["txid"])[::-1]
                 prev_idx = struct.pack("<I", txin["vout"])
                 sequence = struct.pack("<I", txin.get("sequence", 0xfffffffd))
-                tx_ins.append(prev_hash + prev_idx + BitcoinUtils.encode_varint(0) + sequence)
+                tx_ins.append(prev_hash + prev_idx + b"\x00" + sequence)
 
             pk_script = BitcoinUtils.scriptpubkey_from_addr(self.destination_address)
-            output = (
-                struct.pack("<Q", out_val)
-                + BitcoinUtils.encode_varint(len(pk_script))
-                + pk_script
-            )
+            output = struct.pack("<Q", out_val) + bytes([len(pk_script)]) + pk_script
 
             raw_tx = (
                 b"\x02\x00\x00\x00" +
-                BitcoinUtils.encode_varint(len(tx_ins)) +
+                bytes([len(tx_ins)]) +
                 b"".join(tx_ins) +
-                BitcoinUtils.encode_varint(1) +
+                b"\x01" +
                 output +
                 b"\x00\x00\x00\x00"
             ).hex()
@@ -449,7 +404,7 @@ class RBFSweeper:
         log.info(f"Building RBF transaction for {txid}...")
         result = self.build_rbf_tx(tx_data, fee_rate)
         if not result:
-            self.stats.record_rbf(success=False)
+            self.stats.update(is_rbf=True, success=False)
             return {"status": "error", "error": "Failed to build RBF transaction"}
 
         raw_tx, profit_sat = result
@@ -459,10 +414,10 @@ class RBFSweeper:
 
         success = any(v.get("status") == "success" for v in broadcast.values())
         if success:
-            self.stats.record_rbf(success=True, profit_sat=profit_sat)
+            self.stats.update(is_rbf=True, success=True, profit_sat=profit_sat)
             log.info(f"SUCCESS -> Profit: {profit_sat} sat")
         else:
-            self.stats.record_rbf(success=False)
+            self.stats.update(is_rbf=True, success=False)
             log.warning(f"Failed to sweep {txid}")
 
         return {
