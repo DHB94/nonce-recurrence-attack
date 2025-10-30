@@ -36,8 +36,15 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import psutil
 from tqdm import tqdm
 
-from sage.all import EllipticCurve, GF, ZZ, crt, factor
-from sage.groups.generic import bsgs, discrete_log_rho
+from sage.all import (
+    EllipticCurve,
+    GF,
+    ZZ,
+    bsgs,
+    crt,
+    discrete_log_rho,
+    factor,
+)
 
 # =============================================================================
 # Constants for secp256k1
