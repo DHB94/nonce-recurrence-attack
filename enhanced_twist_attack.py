@@ -20,6 +20,7 @@ import json
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from typing import Dict, List, Optional, Tuple
 
 from sage.all import (
@@ -59,6 +60,7 @@ class EnhancedTwistAttack:
         self.max_workers = max_workers
         self.curves: Dict[str, EllipticCurve] = {}
         self._cache: Dict[str, Dict[str, int]] = {}
+        self._order_lock = threading.Lock()
 
         # Initialize curves
         self.initialize_curves()
@@ -277,8 +279,9 @@ class EnhancedTwistAttack:
                 return self._convert_to_python(self._cache[cache_key])
 
             print(f"  Computing order for {curve_name}...")
-            order = int(curve.order())
-            factors = factor(ZZ(order))
+            with self._order_lock:
+                order = int(curve.order())
+                factors = factor(ZZ(order))
 
             factors_list = [(int(p), int(e)) for p, e in factors]
             small_subgroups = [int(p) for p, _ in factors if p < self.threshold]
