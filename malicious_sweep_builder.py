@@ -50,7 +50,7 @@ MAX_WORKERS = 5  # Number of parallel workers
 MAX_TXS_TO_PROCESS = 1000  # Limit transactions to process
 BATCH_SIZE = 20  # Process transactions in batches
 SAT_PER_BTC = Decimal("100000000")
-QUICKNODE_ENDPOINT = "https://greatest-billowing-grass.btc.quiknode.pro/"  # Replace with your QuickNode API key
+QUICKNODE_ENDPOINT = os.getenv("QUICKNODE_ENDPOINT")
 
 # ----------------------------------------------------------------------
 # API ENDPOINTS
