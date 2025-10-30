@@ -19,14 +19,7 @@ const TARGET = process.env.TARGET_TOKEN.toLowerCase();
 const ADDRESS_FILE   = "FlashBotArb.address.txt";
 const PROFIT_JSON    = "profit_per_token.json";
 const PROFIT_CSV     = "profit_per_token.csv";
-const MIN_ABS_PROFIT_NATIVE_RAW = process.env.MIN_ABS_PROFIT_NATIVE || "0.002";
-const MIN_ABS_PROFIT_NATIVE = (() => {
-  try {
-    return ethers.parseUnits(MIN_ABS_PROFIT_NATIVE_RAW, 18);
-  } catch (_) {
-    return 0n;
-  }
-})();
+const MIN_ABS_PROFIT_NATIVE = ethers.parseUnits(process.env.MIN_ABS_PROFIT_NATIVE || "0.002", 18);
 
 let rpcIndex = 0;
 function getProvider() { return new ethers.JsonRpcProvider(RPC_LIST[rpcIndex]); }
@@ -173,6 +166,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase, IBalancerFlashLoanRecip
     }
 
     function executeOperation(address[] calldata assets,uint256[] calldata amounts,uint256[] calldata premiums,address,bytes calldata) external override returns (bool) {
+        require(msg.sender == address(POOL), "invalid sender");
         address asset = assets[0]; uint256 amount = amounts[0];
         _processLoan(asset, amount, premiums[0], address(POOL), true);
         return true;
@@ -255,71 +249,47 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase, IBalancerFlashLoanRecip
 
 // ======== compiler: hardened dynamic lookup ========
 function compileFlashBot() {
-  const baseInput = {
+  const input = {
     language: "Solidity",
     sources: { "FlashBotArbMultiVenue.sol": { content: FLASHBOT_SOURCE } },
     settings: {
       optimizer: { enabled: true, runs: 200 },
+      viaIR: true, // <--- THIS IS THE KEY FIX!
       outputSelection: { "*": { "*": ["abi", "evm.bytecode"] } }
     }
   };
 
-  const attempts = [true, false];
-  let lastError = null;
-
-  for (const viaIR of attempts) {
-    const input = JSON.parse(JSON.stringify(baseInput));
-    input.settings.viaIR = viaIR;
-
-    let output;
-    try {
-      output = JSON.parse(solc.compile(JSON.stringify(input)));
-    } catch (err) {
-      lastError = err;
-      console.error("❌ solc.compile() failed:", err);
-      continue;
-    }
-
-    const errors = (output.errors || []).filter(Boolean);
-    if (errors.length) {
-      errors.forEach(e => console.error(e.formattedMessage || e.message || String(e)));
-      const hasHardError = errors.some(e => e.severity === "error");
-      if (hasHardError) {
-        lastError = new Error("Solidity compile failed");
-        if (viaIR) {
-          console.warn("⚠️ viaIR compilation failed, retrying without IR...");
-          continue;
-        }
-        continue;
-      }
-    }
-
-    const fileNames = Object.keys(output.contracts || {});
-    if (!fileNames.length) {
-      lastError = new Error("No contracts in compiler output");
-      continue;
-    }
-    const contracts = output.contracts[fileNames[0]];
-    const names = Object.keys(contracts || {});
-    if (!names.length) {
-      lastError = new Error(`No contract names in ${fileNames[0]}`);
-      continue;
-    }
-    const name = names[0];
-    const art = contracts[name];
-
-    if (!art || !art.evm || !art.evm.bytecode || !art.evm.bytecode.object) {
-      lastError = new Error("Compiled contract artifact missing bytecode");
-      continue;
-    }
-
-    console.log(`✅ Compiled ${name} from ${fileNames[0]} (viaIR=${viaIR})`);
-    return { abi: art.abi, bytecode: art.evm.bytecode.object };
+  let output;
+  try {
+    output = JSON.parse(solc.compile(JSON.stringify(input)));
+  } catch (err) {
+    console.error("❌ solc.compile() failed:", err);
+    process.exit(1);
   }
 
-  console.error("❌ Solidity compile failed due to errors above.");
-  if (lastError) console.error(lastError.message || lastError);
-  process.exit(1);
+  if (output.errors && output.errors.length) {
+    for (const e of output.errors) console.error(e.formattedMessage || e.message || String(e));
+    if (output.errors.some(e => e.severity === "error")) {
+      console.error("❌ Solidity compile failed due to errors above.");
+      process.exit(1);
+    }
+  }
+
+  const fileNames = Object.keys(output.contracts || {});
+  if (!fileNames.length) { console.error("❌ No contracts in compiler output."); process.exit(1); }
+  const contracts = output.contracts[fileNames[0]];
+  const names = Object.keys(contracts || {});
+  if (!names.length) { console.error(`❌ No contract names in ${fileNames[0]}`); process.exit(1); }
+  const name = names[0];
+  const art = contracts[name];
+
+  if (!art || !art.evm || !art.evm.bytecode || !art.evm.bytecode.object) {
+    console.error("❌ Compiled contract artifact missing bytecode.");
+    process.exit(1);
+  }
+
+  console.log(`✅ Compiled ${name} from ${fileNames[0]}`);
+  return { abi: art.abi, bytecode: art.evm.bytecode.object };
 }
 
 // ======== ABIs ========
@@ -330,8 +300,7 @@ const CURVE_POOL_ABI = [
   "function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256)"
 ];
 const BALANCER_VAULT_ABI = [
-  "function queryBatchSwap(uint8 kind, tuple(bytes32 poolId,uint256 assetInIndex,uint256 assetOutIndex,uint256 amount,bytes userData)[] swaps, address[] assets, tuple(address sender,bool fromInternalBalance,address recipient,bool toInternalBalance) funds) external view returns (int256[] memory)",
-  "function getPoolTokens(bytes32 poolId) view returns (address[] memory tokens, uint256[] memory balances, uint256 lastChangeBlock)"
+  "function queryBatchSwap(uint8 kind, tuple(bytes32 poolId,uint256 assetInIndex,uint256 assetOutIndex,uint256 amount,bytes userData)[] swaps, address[] assets, tuple(address sender,bool fromInternalBalance,address recipient,bool toInternalBalance) funds) external view returns (int256[] memory)"
 ];
 const PROVIDER_ABI = ["function getPool() view returns (address)"];
 const POOL_ABI     = ["function FLASHLOAN_PREMIUM_TOTAL() view returns (uint128)"];
@@ -353,7 +322,7 @@ async function deploy(force) {
   }
   console.log("🚀 Deploying FlashBotArb...");
   const factory = new ethers.ContractFactory(abi, bytecode, wallet);
-  const balancerAddr = BALANCER_VAULT.address;
+  const balancerAddr = process.env.BALANCER_VAULT_ADDRESS || "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
   const flashBot = await factory.deploy(process.env.AAVE_POOL_ADDRESSES_PROVIDER, balancerAddr);
   await flashBot.waitForDeployment();
   const deployedAddress = await flashBot.getAddress();
@@ -436,270 +405,12 @@ const BALANCER_VAULT = {
   type: "balancer"
 };
 const BALANCER_FEE_BPS = BigInt(process.env.BALANCER_FLASH_FEE_BPS || "9");
-const BALANCER_POOL_REGISTRY_FILE = "balancer_pools.json";
-const BALANCER_SUBGRAPH_URL = process.env.BALANCER_SUBGRAPH_URL || "https://api.thegraph.com/subgraphs/name/balancer-labs/balancer-polygon-v2";
-
-const DEFAULT_BALANCER_POOLS = [
-  {
-    name: "Balancer 50 WMATIC 50 WETH",
-    poolId: "0x6cfaf40300aa32fa1a3c453f1a6b3ad72037a4af000200000000000000000000",
-    tokens: [toLower(WMATIC), toLower("0x7ceb23fd6bc0add59e62ac25578270cff1b9f619")],
-    swapFeeBps: 30
-  },
-  {
-    name: "Balancer 50 WETH 50 USDC",
-    poolId: "0x8159462d255c1d24915cb51ec361f700174cd994000200000000000000000000",
-    tokens: [toLower("0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"), toLower("0x2791bca1f2de4661ed88a30c99a7a9449aa84174")],
-    swapFeeBps: 30
-  }
-];
-
-const balancerRegistry = loadBalancerPoolRegistry();
-const balancerPoolCache = new Map();
-const balancerTokenCache = new Map();
 
 // ======== helpers ========
 function min(a, b) { return a < b ? a : b; }
 function formatUnits(bi, dec) { try { return ethers.formatUnits(bi, dec); } catch (_) { return bi.toString(); } }
 function toLower(addr) { return (addr || "").toLowerCase(); }
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
-const minProfitCache = new Map();
-function minProfitForToken(token) {
-  if (!token || !token.asset) return 0n;
-  const key = toLower(token.asset);
-  if (minProfitCache.has(key)) return minProfitCache.get(key);
-  let threshold = 0n;
-  try {
-    threshold = ethers.parseUnits(MIN_ABS_PROFIT_NATIVE_RAW, token.decimals ?? 18);
-  } catch (_) {
-    threshold = 0n;
-  }
-  minProfitCache.set(key, threshold);
-  return threshold;
-}
-
-function pairKey(a, b) {
-  return [toLower(a), toLower(b)].sort().join(":");
-}
-
-function registerBalancerPool(map, pool) {
-  if (!pool || !pool.poolId) return;
-  const poolId = pool.poolId.toLowerCase();
-  if (poolId === "0x" || poolId.length !== 66) return;
-  const tokens = Array.isArray(pool.tokens) ? pool.tokens.map(toLower) : [];
-  if (tokens.length < 2) return;
-  const swapFeeBps = pool.swapFeeBps !== undefined && pool.swapFeeBps !== null
-    ? BigInt(Math.max(0, Math.round(Number(pool.swapFeeBps))))
-    : null;
-
-  for (let i = 0; i < tokens.length; i++) {
-    for (let j = i + 1; j < tokens.length; j++) {
-      const key = pairKey(tokens[i], tokens[j]);
-      if (!map.has(key)) {
-        map.set(key, {
-          poolId,
-          name: pool.name || "static",
-          swapFeeBps,
-          tokens
-        });
-      }
-    }
-  }
-}
-
-async function verifyAddressCode(provider, address, label) {
-  const target = (address || "").toLowerCase();
-  if (!target || target === ethers.ZeroAddress) {
-    console.warn(`⚠️ ${label} address missing`);
-    return false;
-  }
-  try {
-    const code = await provider.getCode(target);
-    if (!code || code === "0x") {
-      console.warn(`⚠️ ${label} @ ${address} has no contract bytecode`);
-      return false;
-    }
-    console.log(`✅ ${label} @ ${address} verified on-chain`);
-    return true;
-  } catch (err) {
-    console.warn(`⚠️ Failed to verify ${label} @ ${address}: ${err.message || err}`);
-    return false;
-  }
-}
-
-async function verifyContractCatalog(provider) {
-  const checks = [];
-  checks.push(verifyAddressCode(provider, process.env.AAVE_POOL_ADDRESSES_PROVIDER, "Aave AddressesProvider"));
-  if (BALANCER_VAULT.address) {
-    checks.push(verifyAddressCode(provider, BALANCER_VAULT.address, "Balancer Vault"));
-  }
-
-  for (const router of ROUTERS) {
-    checks.push(verifyAddressCode(provider, router.address, `${router.name} router`));
-  }
-  for (const pool of CURVE_POOLS) {
-    checks.push(verifyAddressCode(provider, pool.address, `${pool.name}`));
-  }
-  for (const token of TOKENS) {
-    checks.push(verifyAddressCode(provider, token.asset, `${token.symbol} token`));
-  }
-
-  await Promise.all(checks);
-}
-
-async function verifyBalancerRegistry(vault) {
-  if (!vault || !vault.address) return;
-  const seen = new Set();
-  const promises = [];
-  for (const { poolId, name } of balancerRegistry.values()) {
-    if (seen.has(poolId)) continue;
-    seen.add(poolId);
-    promises.push((async () => {
-      try {
-        const tokens = await getBalancerPoolTokens(vault, poolId);
-        if (!tokens || tokens.length === 0) {
-          console.warn(`⚠️ Balancer pool ${name} (${poolId}) returned no tokens`);
-        } else {
-          console.log(`✅ Balancer pool ${name} (${poolId}) has ${tokens.length} tokens`);
-        }
-      } catch (err) {
-        console.warn(`⚠️ Failed to load Balancer pool ${name} (${poolId}): ${err.message || err}`);
-      }
-    })());
-  }
-  await Promise.all(promises);
-}
-
-function loadBalancerPoolRegistry() {
-  const registry = new Map();
-  for (const pool of DEFAULT_BALANCER_POOLS) {
-    registerBalancerPool(registry, pool);
-  }
-  if (fs.existsSync(BALANCER_POOL_REGISTRY_FILE)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(BALANCER_POOL_REGISTRY_FILE, "utf8"));
-      if (Array.isArray(parsed)) {
-        for (const pool of parsed) registerBalancerPool(registry, pool);
-      }
-    } catch (err) {
-      console.warn("⚠️ Failed to parse balancer_pools.json:", err.message);
-    }
-  }
-  return registry;
-}
-
-async function fetchBalancerPoolFromGraph(tokenIn, tokenOut) {
-  if (typeof fetch !== "function" || !BALANCER_SUBGRAPH_URL) return null;
-  const lowerIn = toLower(tokenIn);
-  const lowerOut = toLower(tokenOut);
-  const body = JSON.stringify({
-    query: `query ($tokens: [Bytes!]) {
-      pools(first: 6, orderBy: totalLiquidity, orderDirection: desc,
-            where: { swapEnabled: true, tokensList_contains: $tokens }) {
-        id
-        name
-        swapFee
-        tokensList
-      }
-    }`,
-    variables: { tokens: [lowerIn, lowerOut] }
-  });
-
-  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
-  const timeout = controller ? setTimeout(() => controller.abort(), 4000) : null;
-
-  try {
-    const res = await fetch(BALANCER_SUBGRAPH_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-      signal: controller ? controller.signal : undefined
-    });
-    if (!res.ok) return null;
-    const json = await res.json();
-    const pools = json?.data?.pools;
-    if (!Array.isArray(pools)) return null;
-    for (const pool of pools) {
-      if (!pool?.id || !Array.isArray(pool.tokensList)) continue;
-      const tokens = pool.tokensList.map(toLower);
-      if (!tokens.includes(lowerIn) || !tokens.includes(lowerOut)) continue;
-      const swapFeeBps = pool.swapFee ? BigInt(Math.round(parseFloat(pool.swapFee) * 10000)) : null;
-      return {
-        poolId: pool.id.toLowerCase(),
-        name: pool.name || "subgraph",
-        swapFeeBps,
-        tokens
-      };
-    }
-  } catch (err) {
-    if (process.env.DEBUG_BALANCER === "1") {
-      console.warn("⚠️ Balancer subgraph lookup failed:", err.message || err);
-    }
-  } finally {
-    if (timeout) clearTimeout(timeout);
-  }
-  return null;
-}
-
-async function resolveBalancerPool(tokenIn, tokenOut, overridePoolId) {
-  const lowerIn = toLower(tokenIn);
-  const lowerOut = toLower(tokenOut);
-  const key = pairKey(lowerIn, lowerOut);
-
-  if (overridePoolId) {
-    const entry = {
-      poolId: overridePoolId.toLowerCase(),
-      name: "override",
-      swapFeeBps: null
-    };
-    balancerPoolCache.set(key, entry);
-    return entry;
-  }
-
-  if (balancerPoolCache.has(key)) {
-    return balancerPoolCache.get(key);
-  }
-
-  if (balancerRegistry.has(key)) {
-    const entry = balancerRegistry.get(key);
-    balancerPoolCache.set(key, entry);
-    return entry;
-  }
-
-  const fetched = await fetchBalancerPoolFromGraph(lowerIn, lowerOut);
-  if (fetched) {
-    registerBalancerPool(balancerRegistry, fetched);
-    balancerPoolCache.set(key, fetched);
-    return fetched;
-  }
-
-  return null;
-}
-
-async function getBalancerPoolTokens(vault, poolId) {
-  const key = poolId.toLowerCase();
-  if (balancerTokenCache.has(key)) {
-    return balancerTokenCache.get(key);
-  }
-  try {
-    const result = await vault.contract.getPoolTokens(poolId);
-    const tokens = Array.isArray(result?.[0]) ? result[0].map(toLower) : [];
-    balancerTokenCache.set(key, tokens);
-    return tokens;
-  } catch (err) {
-    balancerTokenCache.set(key, []);
-    if (process.env.DEBUG_BALANCER === "1") {
-      console.warn("⚠️ Balancer getPoolTokens failed:", err.message || err);
-    }
-    return [];
-  }
-}
-
-function getStaticBalancerPoolId(tokenIn, tokenOut) {
-  const entry = balancerRegistry.get(pairKey(tokenIn, tokenOut));
-  return entry ? entry.poolId : ethers.ZeroHash;
-}
 
 function buildRouters(provider) {
   return ROUTERS.map(r => ({
@@ -752,59 +463,24 @@ function slippageAdjust(value, bps) {
 
 function computeSizeSchedule(token, available, cfg) {
   if (available <= 0n) return [];
-  const multiplierBps = BigInt(cfg.stepMultiplierBps || 18000);
+  const multiplierBps = BigInt(cfg.stepMultiplierBps || 18000); // 1.8x default
   const maxSteps = Number(cfg.maxSteps || 5);
-  const maxShareBps = BigInt(cfg.maxShareBps || 250);
-
-  let base = 0n;
-  try {
-    base = ethers.parseUnits(String(cfg.base ?? "0.1"), token.decimals);
-  } catch (_) {
-    base = 0n;
-  }
-
-  let maxNotional = null;
-  if (cfg.maxNotional !== undefined && cfg.maxNotional !== null && cfg.maxNotional !== "") {
-    try {
-      maxNotional = ethers.parseUnits(String(cfg.maxNotional), token.decimals);
-    } catch (_) {
-      maxNotional = null;
-    }
-  }
-
-  let cap = maxShareBps > 0n ? (available * maxShareBps) / 10000n : available;
-  if (cap <= 0n) cap = available;
-  if (maxNotional && maxNotional > 0n) {
-    cap = cap > 0n ? min(cap, maxNotional) : maxNotional;
-  }
-
-  if (cap <= 0n) return [];
-
+  const maxShareBps = BigInt(cfg.maxShareBps || 250); // 2.5% default
+  let base = ethers.parseUnits(cfg.base || "0.1", token.decimals);
+  const cap = maxShareBps > 0n ? (available * maxShareBps) / 10000n : available;
+  if (cap > 0n) base = min(base, cap);
   if (base <= 0n) base = cap;
-  else base = min(base, cap);
-
-  if (maxNotional && maxNotional > 0n) {
-    base = min(base, maxNotional);
-  }
-
   if (base <= 0n) return [];
-
   const schedule = [];
   let current = base;
   for (let i = 0; i < maxSteps; i++) {
-    let candidate = cap > 0n ? min(current, cap) : current;
-    if (maxNotional && maxNotional > 0n) {
-      candidate = min(candidate, maxNotional);
-    }
-    if (candidate <= 0n) break;
-    if (!schedule.some(v => v === candidate)) schedule.push(candidate);
+    const capped = cap > 0n ? min(current, cap) : current;
+    if (capped <= 0n) break;
+    if (!schedule.some(v => v === capped)) schedule.push(capped);
     if (multiplierBps <= 10000n) break;
-    const next = (candidate * multiplierBps) / 10000n;
-    if (next === candidate) break;
-    current = next;
+    current = (capped * multiplierBps) / 10000n;
+    if (current === capped) break;
   }
-
-  schedule.sort((a, b) => (a === b ? 0 : a > b ? -1 : 1));
   return schedule;
 }
 
@@ -820,7 +496,7 @@ function loadYieldOpportunities() {
     {
       name: "WMATIC swing via Balancer",
       asset: WMATIC,
-      deposit: { venue: "BalancerV2", path: [WMATIC, "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"], poolId: process.env.BALANCER_WMATIC_WETH_POOLID || getStaticBalancerPoolId(WMATIC, "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619") },
+      deposit: { venue: "BalancerV2", path: [WMATIC, "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"], poolId: process.env.BALANCER_WMATIC_WETH_POOLID || "0x0000000000000000000000000000000000000000000000000000000000000000" },
       redeem: { venue: "SushiV2", path: ["0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", WMATIC] },
       bonusBps: Number(process.env.WMATIC_YIELD_BONUS_BPS || 22)
     }
@@ -858,21 +534,9 @@ async function quoteCurve(pool, amountIn, path) {
 }
 
 async function quoteBalancer(vault, amountIn, path, opts = {}) {
-  if (path.length !== 2) return { out: 0n, poolId: ethers.ZeroHash, source: "invalid", swapFeeBps: null };
-  const [tokenIn, tokenOut] = path.map(toLower);
+  if (path.length !== 2) return { out: 0n, poolId: "0x00" };
   const inIdx = 0, outIdx = 1;
-
-  const resolved = await resolveBalancerPool(tokenIn, tokenOut, opts.poolId);
-  if (!resolved || !resolved.poolId) {
-    return { out: 0n, poolId: ethers.ZeroHash, source: "missing", swapFeeBps: null };
-  }
-
-  const poolId = resolved.poolId;
-  const supportedTokens = await getBalancerPoolTokens(vault, poolId);
-  if (!supportedTokens.includes(tokenIn) || !supportedTokens.includes(tokenOut)) {
-    return { out: 0n, poolId, source: resolved.name, swapFeeBps: resolved.swapFeeBps };
-  }
-
+  const poolId = opts.poolId || "0x0000000000000000000000000000000000000000000000000000000000000000";
   try {
     const swaps = [{ poolId, assetInIndex: inIdx, assetOutIndex: outIdx, amount: amountIn, userData: "0x" }];
     const assets = [path[0], path[1]];
@@ -880,13 +544,8 @@ async function quoteBalancer(vault, amountIn, path, opts = {}) {
     const deltas = await vault.contract.queryBatchSwap(0, swaps, assets, funds);
     const outDelta = deltas[outIdx];
     const out = (typeof outDelta === "bigint") ? -outDelta : -(BigInt(outDelta));
-    return { out: out > 0n ? out : 0n, poolId, source: resolved.name, swapFeeBps: resolved.swapFeeBps };
-  } catch (err) {
-    if (process.env.DEBUG_BALANCER === "1") {
-      console.warn("⚠️ Balancer quote failed:", err.message || err);
-    }
-    return { out: 0n, poolId, source: resolved.name, swapFeeBps: resolved.swapFeeBps };
-  }
+    return { out: out > 0n ? out : 0n, poolId };
+  } catch (_) { return { out: 0n, poolId }; }
 }
 
 async function quoteVenue(venue, amountIn, path, opts = {}) {
@@ -900,7 +559,7 @@ async function quoteVenue(venue, amountIn, path, opts = {}) {
   }
   if (venue.type === "balancer") {
     const q = await quoteBalancer(venue, amountIn, path, opts);
-    return { out: q.out, meta: { poolId: q.poolId, poolSource: q.source, swapFeeBps: q.swapFeeBps } };
+    return { out: q.out, meta: { poolId: q.poolId } };
   }
   return { out: 0n, meta: {} };
 }
@@ -944,8 +603,7 @@ const STRATEGIES = [
       base: process.env.ARB_BASE_SIZE || "0.25",
       stepMultiplierBps: Number(process.env.ARB_STEP_MULTIPLIER_BPS || 17500),
       maxSteps: Number(process.env.ARB_MAX_STEPS || 5),
-      maxShareBps: Number(process.env.ARB_MAX_SHARE_BPS || 350),
-      maxNotional: process.env.ARB_MAX_NOTIONAL || null
+      maxShareBps: Number(process.env.ARB_MAX_SHARE_BPS || 350)
     }
   },
   {
@@ -958,23 +616,16 @@ const STRATEGIES = [
       base: process.env.YIELD_BASE_SIZE || "0.5",
       stepMultiplierBps: Number(process.env.YIELD_STEP_MULTIPLIER_BPS || 16000),
       maxSteps: Number(process.env.YIELD_MAX_STEPS || 4),
-      maxShareBps: Number(process.env.YIELD_MAX_SHARE_BPS || 200),
-      maxNotional: process.env.YIELD_MAX_NOTIONAL || null
+      maxShareBps: Number(process.env.YIELD_MAX_SHARE_BPS || 200)
     }
   }
 ];
 
-function describePlan(strategy, token, size, owed, expectedOut, venueA, venueB, edgeBps, expectedProfit, minProfit) {
-  let line =
+function describePlan(strategy, token, size, owed, expectedOut, venueA, venueB, edgeBps) {
+  console.log(
     `🔎 [${strategy}] ${token.symbol} size ${formatUnits(size, token.decimals)} ` +
-    `via ${venueA} → ${venueB} out ${formatUnits(expectedOut, token.decimals)} owed ${formatUnits(owed, token.decimals)} edge ${edgeBps} bps`;
-  if (expectedProfit !== undefined) {
-    line += ` profit ${formatUnits(expectedProfit, token.decimals)}`;
-  }
-  if (minProfit && minProfit > 0n) {
-    line += ` (threshold ${formatUnits(minProfit, token.decimals)})`;
-  }
-  console.log(line);
+    `via ${venueA} → ${venueB} out ${formatUnits(expectedOut, token.decimals)} owed ${formatUnits(owed, token.decimals)} edge ${edgeBps} bps`
+  );
 }
 
 async function prepareArbitragePlan(ctx, token, size, premiumBps, strategy) {
@@ -983,7 +634,6 @@ async function prepareArbitragePlan(ctx, token, size, premiumBps, strategy) {
   const paths1 = generatePaths(token.asset, TARGET);
   const paths2 = generatePaths(TARGET, token.asset);
   let best = null;
-  const minProfit = minProfitForToken(token);
 
   for (const path1 of paths1) {
     for (const path2 of paths2) {
@@ -1016,12 +666,10 @@ async function prepareArbitragePlan(ctx, token, size, premiumBps, strategy) {
   const edgeBps = (delta * 10000n) / owed;
   if (edgeBps < strategy.minEdgeBps) return null;
 
-  if (delta < minProfit) return null;
-
   const buffer = (owed * strategy.bufferBps) / 10000n;
   if (best.out2 < owed + buffer) return null;
 
-  describePlan(strategy.name, token, size, owed, best.out2, best.venueA.name, best.venueB.name, edgeBps.toString(), delta, minProfit);
+  describePlan(strategy.name, token, size, owed, best.out2, best.venueA.name, best.venueB.name, edgeBps.toString());
 
   const plan = {
     lender: "aave",
@@ -1045,7 +693,6 @@ async function prepareArbitragePlan(ctx, token, size, premiumBps, strategy) {
     balPidB: best.metaB.poolId || ethers.ZeroHash,
     expectedOut: best.out2,
     expectedProfit: delta,
-    minProfit,
     premiumBps
   };
   return plan;
@@ -1056,7 +703,6 @@ async function prepareYieldPlan(ctx, token, size, premiumBps, strategy) {
   if (!opportunities.length) return null;
   const owed = size + (size * premiumBps) / 10000n;
   let best = null;
-  const minProfit = minProfitForToken(token);
 
   for (const op of opportunities) {
     const depositVenue = ctx.venueLookup[op.deposit.venue];
@@ -1096,24 +742,10 @@ async function prepareYieldPlan(ctx, token, size, premiumBps, strategy) {
 
   if (!best) return null;
 
-  const profit = best.out2 - owed;
-  if (profit < minProfit) return null;
-
   const buffer = (owed * strategy.bufferBps) / 10000n;
   if (best.out2 < owed + buffer) return null;
 
-  describePlan(
-    strategy.name,
-    token,
-    size,
-    owed,
-    best.out2,
-    best.venueA.name,
-    best.venueB.name,
-    best.boostBps.toString(),
-    profit,
-    minProfit
-  );
+  describePlan(strategy.name, token, size, owed, best.out2, best.venueA.name, best.venueB.name, best.boostBps.toString());
 
   return {
     lender: "balancer",
@@ -1136,8 +768,7 @@ async function prepareYieldPlan(ctx, token, size, premiumBps, strategy) {
     balPidA: best.metaA.poolId || ethers.ZeroHash,
     balPidB: best.metaB.poolId || ethers.ZeroHash,
     expectedOut: best.out2,
-    expectedProfit: profit,
-    minProfit,
+    expectedProfit: best.out2 - owed,
     premiumBps
   };
 }
@@ -1247,9 +878,6 @@ async function executePlan(ctx, plan) {
   ctx.venues = venueBundle.all;
   ctx.venueLookup = buildVenueLookup(venueBundle.all);
 
-  await verifyContractCatalog(provider);
-  await verifyBalancerRegistry(venueBundle.balancer);
-
   let poolAddr = await getPoolAddr();
   let premiumBps = await getPremiumBps(poolAddr);
 
@@ -1313,8 +941,7 @@ async function executePlan(ctx, plan) {
 
           try {
             const netGain = await executePlan(ctx, plan);
-            const threshold = plan.minProfit ?? minProfitForToken(plan.token);
-            if (netGain >= threshold && netGain > 0n) {
+            if (netGain > 0n) {
               const ts = new Date().toISOString();
               const key = `${token.symbol}:${strategy.name}`;
               const prev = profitState[key] ? BigInt(profitState[key]) : 0n;
@@ -1323,8 +950,6 @@ async function executePlan(ctx, plan) {
               saveProfitState(profitState);
               appendProfitCSV(ts, `${token.symbol}-${strategy.name}`, formatUnits(netGain, token.decimals));
               console.log(`💰 Profit ${token.symbol} (${strategy.name}): +${formatUnits(netGain, token.decimals)} | total ${formatUnits(next, token.decimals)}`);
-            } else if (netGain > 0n) {
-              console.log("ℹ️ Strategy gain below configured threshold");
             } else {
               console.log("ℹ️ Strategy executed without net profit (<= 0)");
             }
