@@ -3,6 +3,7 @@ const fs = require("fs");
 const solc = require("solc");
 const { ethers } = require("ethers");
 const dotenv = require("dotenv");
+const { FlashbotsBundleProvider } = require("@flashbots/ethers-provider-bundle");
 dotenv.config();
 
 // ======== constants & RPC setup ========
@@ -10,38 +11,176 @@ const RPC_LIST = (process.env.RPC_LIST || process.env.WRITE_RPC || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
-if (RPC_LIST.length === 0) { console.error("Missing WRITE_RPC or RPC_LIST in .env"); process.exit(1); }
-if (!process.env.PRIVATE_KEY) { console.error("Missing PRIVATE_KEY in .env"); process.exit(1); }
-if (!process.env.AAVE_POOL_ADDRESSES_PROVIDER) { console.error("Missing AAVE_POOL_ADDRESSES_PROVIDER in .env"); process.exit(1); }
-if (!process.env.TARGET_TOKEN) { console.error("Missing TARGET_TOKEN in .env"); process.exit(1); }
+if (RPC_LIST.length === 0) {
+  console.error("Missing WRITE_RPC or RPC_LIST in .env");
+  process.exit(1);
+}
+if (!process.env.PRIVATE_KEY) {
+  console.error("Missing PRIVATE_KEY in .env");
+  process.exit(1);
+}
+if (!process.env.AAVE_POOL_ADDRESSES_PROVIDER) {
+  console.error("Missing AAVE_POOL_ADDRESSES_PROVIDER in .env");
+  process.exit(1);
+}
+if (!process.env.TARGET_TOKEN) {
+  console.error("Missing TARGET_TOKEN in .env");
+  process.exit(1);
+}
 
-const TARGET = process.env.TARGET_TOKEN.toLowerCase();
-const ADDRESS_FILE   = "FlashBotArb.address.txt";
-const PROFIT_JSON    = "profit_per_token.json";
-const PROFIT_CSV     = "profit_per_token.csv";
-const MIN_ABS_PROFIT_NATIVE = ethers.parseUnits(process.env.MIN_ABS_PROFIT_NATIVE || "0.002", 18);
+function normalizeAddress(value, envName) {
+  const addr = (value || "").trim();
+  if (!addr) {
+    console.error(`Missing ${envName} value`);
+    process.exit(1);
+  }
+  try {
+    return ethers.getAddress(addr);
+  } catch (error) {
+    try {
+      const lowered = addr.toLowerCase();
+      const checksummed = ethers.getAddress(lowered);
+      console.warn(`⚠️ ${envName} not checksummed, normalized to ${checksummed}`);
+      return checksummed;
+    } catch (inner) {
+      console.error(`Invalid address for ${envName}: ${addr}`);
+      console.error(inner.message || inner);
+      process.exit(1);
+    }
+  }
+}
+
+const AAVE_PROVIDER_ADDRESS = normalizeAddress(
+  process.env.AAVE_POOL_ADDRESSES_PROVIDER,
+  "AAVE_POOL_ADDRESSES_PROVIDER"
+);
+const TARGET_ADDRESS = normalizeAddress(process.env.TARGET_TOKEN, "TARGET_TOKEN");
+const TARGET = TARGET_ADDRESS.toLowerCase();
+const ADDRESS_FILE = "FlashBotArb.address.txt";
+const PROFIT_JSON = "profit_per_token.json";
+const PROFIT_CSV = "profit_per_token.csv";
+const MIN_ABS_PROFIT_NATIVE = ethers.parseUnits(
+  process.env.MIN_ABS_PROFIT_NATIVE || "2",
+  18
+);
+const FLASHBOTS_ENDPOINT = "https://rpc.flashbots.net/"; // Polygon Flashbots RPC
 
 let rpcIndex = 0;
-function getProvider() { return new ethers.JsonRpcProvider(RPC_LIST[rpcIndex]); }
-function rotateRPC() {
-  rpcIndex = (rpcIndex + 1) % RPC_LIST.length;
-  console.warn("🔁 Switched RPC → " + RPC_LIST[rpcIndex]);
-  return getProvider();
+async function getProvider(maxRetries = 3, retryDelay = 1000) {
+  const provider = new ethers.JsonRpcProvider(RPC_LIST[rpcIndex]);
+
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      await provider.getBlockNumber();
+      return provider;
+    } catch (error) {
+      if (i === maxRetries - 1) throw error;
+      console.warn(`⚠️ RPC connection attempt ${i + 1} failed, retrying...`);
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
+  }
+
+  throw new Error(`Failed to connect to RPC after ${maxRetries} attempts`);
 }
-let provider = getProvider();
+
+async function rotateRPC() {
+  const initialIndex = rpcIndex;
+  let attempts = 0;
+
+  do {
+    rpcIndex = (rpcIndex + 1) % RPC_LIST.length;
+    attempts++;
+
+    try {
+      console.warn(`🔄 Attempting to switch to RPC ${rpcIndex + 1}/${RPC_LIST.length}`);
+      const provider = await getProvider(1);
+      console.warn(
+        `✅ Connected to RPC ${rpcIndex + 1}: ${RPC_LIST[rpcIndex].substring(0, 40)}...`
+      );
+      return provider;
+    } catch (error) {
+      console.warn(`❌ Failed to connect to RPC ${rpcIndex + 1}: ${error.message}`);
+      if (attempts >= RPC_LIST.length) {
+        throw new Error(
+          "All RPC endpoints failed. Please check your internet connection or try again later."
+        );
+      }
+    }
+  } while (rpcIndex !== initialIndex);
+
+  throw new Error("RPC rotation failed");
+}
+
+let provider;
 let wallet;
-try { wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider); }
-catch (_) { console.error("Invalid PRIVATE_KEY"); process.exit(1); }
+
+(async () => {
+  try {
+    provider = await getProvider();
+    wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+
+    main().catch(error => {
+      console.error("❌ Fatal error in main loop:", error);
+      process.exit(1);
+    });
+  } catch (error) {
+    console.error("❌ Failed to initialize wallet:", error.message);
+    process.exit(1);
+  }
+})();
 
 // ======== Solidity contract source ========
-const FLASHBOT_SOURCE = `
-// SPDX-License-Identifier: MIT
+const FLASHBOT_SOURCE = `// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.10;
 
 interface IPoolAddressesProvider { function getPool() external view returns (address); }
 interface IPool {
-    function flashLoan(address receiverAddress,address[] calldata assets,uint256[] calldata amounts,uint256[] calldata modes,address onBehalfOf,bytes calldata params,uint16 referralCode) external;
+    function flashLoan(
+        address receiverAddress,
+        address[] calldata assets,
+        uint256[] calldata amounts,
+        uint256[] calldata modes,
+        address onBehalfOf,
+        bytes calldata params,
+        uint16 referralCode
+    ) external;
     function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
+}
+interface IBalancerVault {
+    struct SingleSwap {
+        bytes32 poolId;
+        uint8 kind;
+        address assetIn;
+        address assetOut;
+        uint256 amount;
+        bytes userData;
+    }
+    struct FundManagement {
+        address sender;
+        bool fromInternalBalance;
+        address recipient;
+        bool toInternalBalance;
+    }
+    function swap(
+        SingleSwap calldata singleSwap,
+        FundManagement calldata funds,
+        uint256 limit,
+        uint256 deadline
+    ) external returns (uint256);
+    function flashLoan(
+        address recipient,
+        address[] calldata tokens,
+        uint256[] calldata amounts,
+        bytes calldata data
+    ) external;
+}
+interface IFlashLoanRecipient {
+    function receiveFlashLoan(
+        address[] calldata tokens,
+        uint256[] calldata amounts,
+        uint256[] calldata feeAmounts,
+        bytes calldata data
+    ) external returns (bool);
 }
 abstract contract FlashLoanReceiverBase {
     IPoolAddressesProvider public immutable ADDRESSES_PROVIDER;
@@ -50,31 +189,89 @@ abstract contract FlashLoanReceiverBase {
         ADDRESSES_PROVIDER = provider;
         POOL = IPool(provider.getPool());
     }
-    function executeOperation(address[] calldata assets,uint256[] calldata amounts,uint256[] calldata premiums,address initiator,bytes calldata params) external virtual returns (bool);
+    function executeOperation(
+        address[] calldata assets,
+        uint256[] calldata amounts,
+        uint256[] calldata premiums,
+        address initiator,
+        bytes calldata params
+    ) external virtual returns (bool);
 }
 interface IERC20 {
     function approve(address spender,uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
-    function transfer(address recipient,uint256 amount) external returns (bool);
 }
-interface IUniswapV2Router02 { function swapExactTokensForTokens(uint amountIn,uint amountOutMin,address[] calldata path,address to,uint deadline) external returns (uint[] memory amounts); }
-interface ICurvePool { function exchange(int128 i,int128 j,uint256 dx,uint256 min_dy) external returns (uint256); }
-interface IBalancerVault {
-    struct SingleSwap { bytes32 poolId; uint8 kind; address assetIn; address assetOut; uint256 amount; bytes userData; }
-    struct FundManagement { address sender; bool fromInternalBalance; address recipient; bool toInternalBalance; }
-    function swap(SingleSwap calldata singleSwap, FundManagement calldata funds, uint256 limit, uint256 deadline) external returns (uint256);
-    function flashLoan(address recipient,address[] calldata tokens,uint256[] calldata amounts,bytes calldata userData) external;
+interface IUniswapV2Router02 {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
 }
-interface IBalancerFlashLoanRecipient {
-    function receiveFlashLoan(address[] calldata tokens,uint256[] calldata amounts,uint256[] calldata feeAmounts,bytes calldata userData) external;
+interface ICurvePool {
+    function exchange(int128 i,int128 j,uint256 dx,uint256 min_dy) external returns (uint256);
+}
+interface I1InchAggregator {
+    function swap(
+        address fromToken,
+        address toToken,
+        uint256 amount,
+        uint256 minReturnAmount,
+        uint256[] calldata pools,
+        uint256 flags,
+        address payable referrer
+    ) external payable returns (uint256 returnAmount);
 }
 
-contract FlashBotArbMultiVenue is FlashLoanReceiverBase, IBalancerFlashLoanRecipient {
+contract FlashBotArbMultiVenue is FlashLoanReceiverBase, IFlashLoanRecipient {
+    struct SwapParams {
+        address routerA;
+        address routerB;
+        address[] path1;
+        address[] path2;
+        uint256 minOut1;
+        uint256 minOut2;
+        uint8 legTypeA;
+        uint8 legTypeB;
+        bytes32 balPoolIdA;
+        bytes32 balPoolIdB;
+        int128 curveI1;
+        int128 curveJ1;
+        int128 curveI2;
+        int128 curveJ2;
+    }
+
+    SwapParams private swapParams;
     address public immutable owner;
-    address public immutable balancerVault;
     uint8 public pTypeA;
     uint8 public pTypeB;
     address public pRouterA;
+
+    bool private locked;
+
+    event FlashLoanReceived(address indexed token, uint256 amount, uint256 fee);
+    event FlashLoanRepaid(address indexed token, uint256 amount, uint256 fee);
+    event SwapFailed(address indexed router, string reason);
+    event EmergencyWithdraw(address indexed token, uint256 amount);
+    event Leg1(address router,uint8 legType,address[] path,uint256 amountIn,uint256 minOut,uint256 amountOut);
+    event Leg2(address router,uint8 legType,address[] path,uint256 amountIn,uint256 minOut,uint256 amountOut);
+    event Repay(uint256 owed,uint256 balance);
+    event Profit(uint256 netGain);
+
+    modifier noReentrant() {
+        require(!locked, "No re-entrancy");
+        locked = true;
+        _;
+        locked = false;
+    }
+
+    modifier onlyPool() {
+        require(msg.sender == address(POOL), "Caller is not the pool");
+        _;
+    }
+
     address public pRouterB;
     address[] public pPath1;
     address[] public pPath2;
@@ -87,16 +284,8 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase, IBalancerFlashLoanRecip
     int128 public pCurveI2;
     int128 public pCurveJ2;
 
-    event Leg1(address router,uint8 legType,address[] path,uint256 amountIn,uint256 minOut,uint256 amountOut);
-    event Leg2(address router,uint8 legType,address[] path,uint256 amountIn,uint256 minOut,uint256 amountOut);
-    event Repay(uint256 owed,uint256 balance);
-    event Profit(uint256 netGain);
-
-    bool private inFlight;
-
-    constructor(address provider,address balancer) FlashLoanReceiverBase(IPoolAddressesProvider(provider)) {
+    constructor(address provider) FlashLoanReceiverBase(IPoolAddressesProvider(provider)) {
         owner = msg.sender;
-        balancerVault = balancer;
     }
 
     function initiateFlashLoanMulti(
@@ -111,138 +300,228 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase, IBalancerFlashLoanRecip
         require(msg.sender == owner,"only owner");
         require(routerA != address(0) && routerB != address(0),"invalid routers");
         require(path1.length >= 2 && path2.length >= 2,"invalid paths");
-        require(typeA <= 2 && typeB <= 2,"invalid types");
-
+        require(typeA <= 3 && typeB <= 3,"invalid types");
         pRouterA = routerA; pRouterB = routerB;
         pPath1 = path1; pPath2 = path2;
         pMinOut1 = minOut1; pMinOut2 = minOut2;
         pTypeA = typeA; pTypeB = typeB;
         pBalPoolIdA = balPoolIdA; pBalPoolIdB = balPoolIdB;
         pCurveI1 = curveI1; pCurveJ1 = curveJ1; pCurveI2 = curveI2; pCurveJ2 = curveJ2;
-
         address[] memory assets = new address[](1); assets[0] = asset;
         uint256[] memory amounts = new uint256[](1); amounts[0] = amount;
         uint256[] memory modes = new uint256[](1); modes[0] = 0;
-
-        require(!inFlight, "active");
-        inFlight = true;
         POOL.flashLoan(address(this), assets, amounts, modes, address(this), "", 0);
-        inFlight = false;
-
-        _resetState();
-    }
-
-    function initiateBalancerFlashLoanMulti(
-        address asset,uint256 amount,
-        address routerA,address routerB,
-        address[] calldata path1,address[] calldata path2,
-        uint256 minOut1,uint256 minOut2,
-        uint8 typeA,uint8 typeB,
-        bytes32 balPoolIdA,bytes32 balPoolIdB,
-        int128 curveI1,int128 curveJ1,int128 curveI2,int128 curveJ2
-    ) external {
-        require(msg.sender == owner,"only owner");
-        require(balancerVault != address(0),"balancer disabled");
-        require(routerA != address(0) && routerB != address(0),"invalid routers");
-        require(path1.length >= 2 && path2.length >= 2,"invalid paths");
-        require(typeA <= 2 && typeB <= 2,"invalid types");
-
-        pRouterA = routerA; pRouterB = routerB;
-        pPath1 = path1; pPath2 = path2;
-        pMinOut1 = minOut1; pMinOut2 = minOut2;
-        pTypeA = typeA; pTypeB = typeB;
-        pBalPoolIdA = balPoolIdA; pBalPoolIdB = balPoolIdB;
-        pCurveI1 = curveI1; pCurveJ1 = curveJ1; pCurveI2 = curveI2; pCurveJ2 = curveJ2;
-
-        address[] memory tokens = new address[](1); tokens[0] = asset;
-        uint256[] memory amounts = new uint256[](1); amounts[0] = amount;
-
-        require(!inFlight, "active");
-        inFlight = true;
-        IBalancerVault(balancerVault).flashLoan(address(this), tokens, amounts, "");
-        inFlight = false;
-
-        _resetState();
-    }
-
-    function executeOperation(address[] calldata assets,uint256[] calldata amounts,uint256[] calldata premiums,address,bytes calldata) external override returns (bool) {
-        require(msg.sender == address(POOL), "invalid sender");
-        address asset = assets[0]; uint256 amount = amounts[0];
-        _processLoan(asset, amount, premiums[0], address(POOL), true);
-        return true;
-    }
-
-    function receiveFlashLoan(address[] calldata tokens,uint256[] calldata amounts,uint256[] calldata feeAmounts,bytes calldata) external override {
-        require(msg.sender == balancerVault, "invalid sender");
-        require(tokens.length == 1 && amounts.length == 1 && feeAmounts.length == 1, "multi token not supported");
-        _processLoan(tokens[0], amounts[0], feeAmounts[0], msg.sender, false);
-    }
-
-    function _processLoan(address asset,uint256 amount,uint256 premium,address repayTarget,bool lenderPulls) internal {
-        uint256 out1 = 0;
-        if (pTypeA == 0) {
-            IERC20(asset).approve(pRouterA, amount);
-            uint256 before1 = IERC20(pPath1[pPath1.length - 1]).balanceOf(address(this));
-            IUniswapV2Router02(pRouterA).swapExactTokensForTokens(amount, pMinOut1, pPath1, address(this), block.timestamp);
-            out1 = IERC20(pPath1[pPath1.length - 1]).balanceOf(address(this)) - before1;
-        } else if (pTypeA == 1) {
-            IERC20(asset).approve(pRouterA, amount);
-            out1 = ICurvePool(pRouterA).exchange(pCurveI1, pCurveJ1, amount, pMinOut1);
-        } else {
-            IERC20(asset).approve(pRouterA, amount);
-            IBalancerVault.SingleSwap memory swapA = IBalancerVault.SingleSwap({
-                poolId: pBalPoolIdA, kind: 0, assetIn: pPath1[0], assetOut: pPath1[1], amount: amount, userData: ""
-            });
-            IBalancerVault.FundManagement memory fundsA = IBalancerVault.FundManagement({
-                sender: address(this), fromInternalBalance: false, recipient: address(this), toInternalBalance: false
-            });
-            out1 = IBalancerVault(pRouterA).swap(swapA, fundsA, pMinOut1, block.timestamp);
-        }
-        emit Leg1(pRouterA, pTypeA, pPath1, amount, pMinOut1, out1);
-
-        uint256 out2 = 0;
-        if (pTypeB == 0) {
-            IERC20(pPath2[0]).approve(pRouterB, out1);
-            uint256 before2 = IERC20(asset).balanceOf(address(this));
-            IUniswapV2Router02(pRouterB).swapExactTokensForTokens(out1, pMinOut2, pPath2, address(this), block.timestamp);
-            out2 = IERC20(asset).balanceOf(address(this)) - before2;
-        } else if (pTypeB == 1) {
-            IERC20(pPath2[0]).approve(pRouterB, out1);
-            out2 = ICurvePool(pRouterB).exchange(pCurveI2, pCurveJ2, out1, pMinOut2);
-        } else {
-            IERC20(pPath2[0]).approve(pRouterB, out1);
-            IBalancerVault.SingleSwap memory swapB = IBalancerVault.SingleSwap({
-                poolId: pBalPoolIdB, kind: 0, assetIn: pPath2[0], assetOut: pPath2[1], amount: out1, userData: ""
-            });
-            IBalancerVault.FundManagement memory fundsB = IBalancerVault.FundManagement({
-                sender: address(this), fromInternalBalance: false, recipient: address(this), toInternalBalance: false
-            });
-            out2 = IBalancerVault(pRouterB).swap(swapB, fundsB, pMinOut2, block.timestamp);
-        }
-        emit Leg2(pRouterB, pTypeB, pPath2, out1, pMinOut2, out2);
-
-        uint256 totalOwed = amount + premium;
-        uint256 balNow = IERC20(asset).balanceOf(address(this));
-        emit Repay(totalOwed, balNow);
-        require(balNow >= totalOwed, "insufficient for repay");
-
-        uint256 netGain = balNow - totalOwed;
-        emit Profit(netGain);
-
-        if (lenderPulls) {
-            IERC20(asset).approve(repayTarget, totalOwed);
-        } else {
-            require(IERC20(asset).transfer(repayTarget, totalOwed), "repay failed");
-        }
-    }
-
-    function _resetState() internal {
         delete pRouterA; delete pRouterB;
         delete pPath1; delete pPath2;
         pMinOut1 = 0; pMinOut2 = 0;
         pTypeA = 0; pTypeB = 0;
         pBalPoolIdA = 0x0; pBalPoolIdB = 0x0;
         pCurveI1 = 0; pCurveJ1 = 0; pCurveI2 = 0; pCurveJ2 = 0;
+    }
+
+    function receiveFlashLoan(
+        address[] calldata tokens,
+        uint256[] calldata amounts,
+        uint256[] calldata feeAmounts,
+        bytes calldata data
+    ) external override onlyPool noReentrant returns (bool) {
+        address token = tokens[0];
+        uint256 amount = amounts[0];
+        uint256 fee = feeAmounts[0];
+        emit FlashLoanReceived(token, amount, fee);
+        (bool success, ) = address(this).call(
+            abi.encodeWithSignature(
+                "executeOperation(address[],uint256[],uint256[],address,bytes)",
+                tokens,
+                amounts,
+                feeAmounts,
+                msg.sender,
+                data
+            )
+        );
+        require(success, "Execute operation failed");
+        (bool transferSuccess, ) = address(token).call(
+            abi.encodeWithSignature("transfer(address,uint256)", msg.sender, amount + fee)
+        );
+        require(transferSuccess, "Token transfer failed");
+        emit FlashLoanRepaid(token, amount, fee);
+        return true;
+    }
+
+    function safeApprove(IERC20 token, address spender, uint256 amount) internal {
+        (bool success1, ) = address(token).call(abi.encodeWithSignature("approve(address,uint256)", spender, 0));
+        require(success1, "Approve reset failed");
+        (bool success2, ) = address(token).call(abi.encodeWithSignature("approve(address,uint256)", spender, amount));
+        require(success2, "Approve failed");
+    }
+
+    function emergencyWithdraw(address token) external {
+        require(msg.sender == owner, "Only owner");
+        if (token == address(0)) {
+            (bool success, ) = payable(owner).call{value: address(this).balance}("");
+            require(success, "ETH transfer failed");
+        } else {
+            (bool success, bytes memory data) = address(token).call(
+                abi.encodeWithSignature("balanceOf(address)", address(this))
+            );
+            require(success, "Balance check failed");
+            uint256 balance = abi.decode(data, (uint256));
+            (success, ) = address(token).call(
+                abi.encodeWithSignature("transfer(address,uint256)", owner, balance)
+            );
+            require(success, "Token transfer failed");
+            emit EmergencyWithdraw(token, balance);
+        }
+    }
+
+    receive() external payable {}
+    fallback() external payable {}
+
+    function executeOperation(
+        address[] calldata assets,
+        uint256[] calldata amounts,
+        uint256[] calldata premiums,
+        address,
+        bytes calldata
+    ) external override noReentrant returns (bool) {
+        address asset = assets[0]; uint256 amount = amounts[0];
+        uint256 out1 = 0;
+        if (pTypeA == 0) {
+            safeApprove(IERC20(asset), pRouterA, amount);
+            uint256 before1 = IERC20(pPath1[pPath1.length - 1]).balanceOf(address(this));
+            try IUniswapV2Router02(pRouterA).swapExactTokensForTokens(
+                amount,
+                pMinOut1,
+                pPath1,
+                address(this),
+                block.timestamp
+            ) {
+                out1 = IERC20(pPath1[pPath1.length - 1]).balanceOf(address(this)) - before1;
+            } catch Error(string memory reason) {
+                emit SwapFailed(pRouterA, reason);
+                revert(string(abi.encodePacked("V2 swap failed: ", reason)));
+            } catch (bytes memory) {
+                emit SwapFailed(pRouterA, "Unknown error");
+                revert("V2 swap failed: Unknown error");
+            }
+        } else if (pTypeA == 1) {
+            safeApprove(IERC20(asset), pRouterA, amount);
+            try ICurvePool(pRouterA).exchange(pCurveI1, pCurveJ1, amount, pMinOut1) {
+                out1 = IERC20(pPath1[pPath1.length - 1]).balanceOf(address(this));
+            } catch Error(string memory reason) {
+                emit SwapFailed(pRouterA, reason);
+                revert(string(abi.encodePacked("Curve swap failed: ", reason)));
+            } catch (bytes memory) {
+                emit SwapFailed(pRouterA, "Unknown error");
+                revert("Curve swap failed: Unknown error");
+            }
+        } else if (pTypeA == 2) {
+            safeApprove(IERC20(asset), pRouterA, amount);
+            IBalancerVault.SingleSwap memory swapA = IBalancerVault.SingleSwap({
+                poolId: pBalPoolIdA,
+                kind: 0,
+                assetIn: pPath1[0],
+                assetOut: pPath1[1],
+                amount: amount,
+                userData: ""
+            });
+            IBalancerVault.FundManagement memory fundsA = IBalancerVault.FundManagement({
+                sender: address(this),
+                fromInternalBalance: false,
+                recipient: payable(address(this)),
+                toInternalBalance: false
+            });
+            try IBalancerVault(pRouterA).swap(swapA, fundsA, pMinOut1, block.timestamp) {
+                out1 = IERC20(pPath1[1]).balanceOf(address(this));
+            } catch Error(string memory reason) {
+                emit SwapFailed(pRouterA, reason);
+                revert(string(abi.encodePacked("Balancer swap failed: ", reason)));
+            } catch (bytes memory) {
+                emit SwapFailed(pRouterA, "Unknown error");
+                revert("Balancer swap failed: Unknown error");
+            }
+        } else if (pTypeA == 3) {
+            safeApprove(IERC20(asset), pRouterA, amount);
+            uint256[] memory pools = new uint256[](1);
+            pools[0] = 1;
+            try I1InchAggregator(pRouterA).swap{ value: 0 }(
+                asset,
+                pPath1[1],
+                amount,
+                pMinOut1,
+                pools,
+                0,
+                payable(address(0))
+            ) returns (uint256 result) {
+                out1 = result;
+            } catch Error(string memory reason) {
+                emit SwapFailed(pRouterA, reason);
+                revert(string(abi.encodePacked("1Inch swap failed: ", reason)));
+            } catch (bytes memory) {
+                emit SwapFailed(pRouterA, "Unknown error");
+                revert("1Inch swap failed: Unknown error");
+            }
+        }
+
+        emit Leg1(pRouterA, pTypeA, pPath1, amount, pMinOut1, out1);
+
+        uint256 out2 = 0;
+        if (pTypeB == 0) {
+            IERC20(pPath2[0]).approve(pRouterB, out1);
+            uint256 before2 = IERC20(asset).balanceOf(address(this));
+            IUniswapV2Router02(pRouterB).swapExactTokensForTokens(
+                out1,
+                pMinOut2,
+                pPath2,
+                address(this),
+                block.timestamp
+            );
+            out2 = IERC20(asset).balanceOf(address(this)) - before2;
+        } else if (pTypeB == 1) {
+            IERC20(pPath2[0]).approve(pRouterB, out1);
+            out2 = ICurvePool(pRouterB).exchange(pCurveI2, pCurveJ2, out1, pMinOut2);
+        } else if (pTypeB == 2) {
+            IERC20(pPath2[0]).approve(pRouterB, out1);
+            IBalancerVault.SingleSwap memory swapB = IBalancerVault.SingleSwap({
+                poolId: pBalPoolIdB,
+                kind: 0,
+                assetIn: pPath2[0],
+                assetOut: pPath2[1],
+                amount: out1,
+                userData: ""
+            });
+            IBalancerVault.FundManagement memory fundsB = IBalancerVault.FundManagement({
+                sender: address(this),
+                fromInternalBalance: false,
+                recipient: address(this),
+                toInternalBalance: false
+            });
+            out2 = IBalancerVault(pRouterB).swap(swapB, fundsB, pMinOut2, block.timestamp);
+        } else if (pTypeB == 3) {
+            IERC20(pPath2[0]).approve(pRouterB, out1);
+            uint256[] memory pools = new uint256[](1);
+            pools[0] = 1;
+            out2 = I1InchAggregator(pRouterB).swap{ value: 0 }(
+                pPath2[0],
+                asset,
+                out1,
+                pMinOut2,
+                pools,
+                0,
+                payable(address(0))
+            );
+        }
+
+        emit Leg2(pRouterB, pTypeB, pPath2, out1, pMinOut2, out2);
+
+        uint256 totalOwed = amount + premiums[0];
+        uint256 balNow = IERC20(asset).balanceOf(address(this));
+        emit Repay(totalOwed, balNow);
+        require(balNow >= totalOwed, "insufficient for repay");
+        uint256 netGain = balNow - totalOwed;
+        emit Profit(netGain);
+        IERC20(asset).approve(address(POOL), totalOwed);
+        return true;
     }
 }
 `;
@@ -253,12 +532,15 @@ function compileFlashBot() {
     language: "Solidity",
     sources: { "FlashBotArbMultiVenue.sol": { content: FLASHBOT_SOURCE } },
     settings: {
-      optimizer: { enabled: true, runs: 200 },
-      viaIR: true, // <--- THIS IS THE KEY FIX!
+      viaIR: true,
+      optimizer: {
+        enabled: true,
+        runs: 200,
+        details: { yul: true }
+      },
       outputSelection: { "*": { "*": ["abi", "evm.bytecode"] } }
     }
   };
-
   let output;
   try {
     output = JSON.parse(solc.compile(JSON.stringify(input)));
@@ -266,28 +548,32 @@ function compileFlashBot() {
     console.error("❌ solc.compile() failed:", err);
     process.exit(1);
   }
-
   if (output.errors && output.errors.length) {
-    for (const e of output.errors) console.error(e.formattedMessage || e.message || String(e));
+    for (const e of output.errors) {
+      console.error(e.formattedMessage || e.message || String(e));
+    }
     if (output.errors.some(e => e.severity === "error")) {
       console.error("❌ Solidity compile failed due to errors above.");
       process.exit(1);
     }
   }
-
   const fileNames = Object.keys(output.contracts || {});
-  if (!fileNames.length) { console.error("❌ No contracts in compiler output."); process.exit(1); }
+  if (!fileNames.length) {
+    console.error("❌ No contracts in compiler output.");
+    process.exit(1);
+  }
   const contracts = output.contracts[fileNames[0]];
   const names = Object.keys(contracts || {});
-  if (!names.length) { console.error(`❌ No contract names in ${fileNames[0]}`); process.exit(1); }
+  if (!names.length) {
+    console.error(`❌ No contract names in ${fileNames[0]}`);
+    process.exit(1);
+  }
   const name = names[0];
   const art = contracts[name];
-
   if (!art || !art.evm || !art.evm.bytecode || !art.evm.bytecode.object) {
     console.error("❌ Compiled contract artifact missing bytecode.");
     process.exit(1);
   }
-
   console.log(`✅ Compiled ${name} from ${fileNames[0]}`);
   return { abi: art.abi, bytecode: art.evm.bytecode.object };
 }
@@ -296,15 +582,17 @@ function compileFlashBot() {
 const V2_ROUTER_ABI = [
   "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)"
 ];
-const CURVE_POOL_ABI = [
-  "function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256)"
-];
+const CURVE_POOL_ABI = ["function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256)"];
 const BALANCER_VAULT_ABI = [
-  "function queryBatchSwap(uint8 kind, tuple(bytes32 poolId,uint256 assetInIndex,uint256 assetOutIndex,uint256 amount,bytes userData)[] swaps, address[] assets, tuple(address sender,bool fromInternalBalance,address recipient,bool toInternalBalance) funds) external view returns (int256[] memory)"
+  "function queryBatchSwap(uint8 kind, tuple(bytes32 poolId,uint256 assetInIndex,uint256 assetOutIndex,uint256 amount,bytes userData)[] swaps, address[] assets, tuple(address sender,bool fromInternalBalance,address recipient,bool toInternalBalance) funds) external view returns (int256[] assetDeltas)",
+  "function flashLoan(address recipient, address[] calldata tokens, uint256[] calldata amounts, bytes calldata data) external"
+];
+const I1INCH_ABI = [
+  "function swap(address fromToken, address toToken, uint256 amount, uint256 minReturnAmount, uint256[] calldata pools, uint256 flags, address payable referrer) external payable returns (uint256 returnAmount)"
 ];
 const PROVIDER_ABI = ["function getPool() view returns (address)"];
-const POOL_ABI     = ["function FLASHLOAN_PREMIUM_TOTAL() view returns (uint128)"];
-const ERC20_ABI    = ["function balanceOf(address) view returns (uint256)"];
+const POOL_ABI = ["function FLASHLOAN_PREMIUM_TOTAL() view returns (uint128)"];
+const ERC20_ABI = ["function balanceOf(address) view returns (uint256)"];
 
 // ======== deploy ========
 async function deploy(force) {
@@ -322,8 +610,7 @@ async function deploy(force) {
   }
   console.log("🚀 Deploying FlashBotArb...");
   const factory = new ethers.ContractFactory(abi, bytecode, wallet);
-  const balancerAddr = process.env.BALANCER_VAULT_ADDRESS || "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
-  const flashBot = await factory.deploy(process.env.AAVE_POOL_ADDRESSES_PROVIDER, balancerAddr);
+  const flashBot = await factory.deploy(AAVE_PROVIDER_ADDRESS);
   await flashBot.waitForDeployment();
   const deployedAddress = await flashBot.getAddress();
   fs.writeFileSync(ADDRESS_FILE, deployedAddress);
@@ -331,186 +618,111 @@ async function deploy(force) {
   return { address: deployedAddress, abi };
 }
 
-// ======== network tokens & venues (Polygon defaults; adjust as needed) ========
-const EXTRA_TOKENS_FILE = "extra_tokens.json";
-const YIELD_CONFIG_FILE = "yield_opportunities.json";
-
-const WMATIC = "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270";
-const WBTC   = "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6";
-const CRV    = "0x172370d5cd63279efa6d502dab29171933a610af";
-const GHST   = "0x385eeac5cd83818ab9e8b8e4e6cd4bbd5d0e2aa6";
-const QUICK  = "0x831753dd7087cac61ab5644b308642cc1c33dc13";
-
-const BASE_TOKENS = [
-  { symbol: "USDC",   asset: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174", decimals: 6  },
-  { symbol: "USDT",   asset: "0xc2132d05d31c914a87c6611c10748aeb04b58e8f", decimals: 6  },
-  { symbol: "DAI",    asset: "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063", decimals: 18 },
+// ======== network tokens & venues (Polygon) ========
+const WMATIC = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270";
+const TOKENS = [
+  { symbol: "USDC", asset: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", decimals: 6 },
   { symbol: "WMATIC", asset: WMATIC, decimals: 18 },
-  { symbol: "WETH",   asset: "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", decimals: 18 },
-  { symbol: "WBTC",   asset: WBTC, decimals: 8 },
-  { symbol: "AAVE",   asset: "0xd6df932a45c0f255f85145f286ea0b292b21c90b", decimals: 18 },
-  { symbol: "LINK",   asset: "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39", decimals: 18 },
-  { symbol: "CRV",    asset: CRV, decimals: 18 },
-  { symbol: "GHST",   asset: GHST, decimals: 18 },
-  { symbol: "QUICK",  asset: QUICK, decimals: 18 }
+  { symbol: "DAI", asset: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", decimals: 18 },
+  { symbol: "USDT", asset: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", decimals: 6 },
+  { symbol: "WETH", asset: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", decimals: 18 },
+  { symbol: "WBTC", asset: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", decimals: 8 },
+  { symbol: "LINK", asset: "0x53E0bca35ec356BD5ddDFebbd1FC0fd03FaBad39", decimals: 18 },
+  { symbol: "AAVE", asset: "0xD6DF932A45C0f255f85145f286eA0b292B21C90B", decimals: 18 },
+  { symbol: "CRV", asset: "0x172370d5Cd63279eFa6d502DAB29171933a610AF", decimals: 18 },
+  { symbol: "SUSHI", asset: "0x0b3F868E0BE5597D5DB7fEB59E1CADBb0fdDa50a", decimals: 18 },
+  { symbol: "GHST", asset: "0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7", decimals: 18 },
+  { symbol: "QUICK", asset: "0x831753DD7087CaC61aB5644b308642cc1c33Dc13", decimals: 18 },
+  { symbol: "BAL", asset: "0x9a71012B13CA4d3D0Cdc72A177DF3ef03b0E76A3", decimals: 18 },
+  { symbol: "MAI", asset: "0xa3Fa99A148fA48D14Ed51d610c367C61876997F1", decimals: 18 }
 ];
 
-function loadTokens() {
-  let merged = [...BASE_TOKENS];
-  if (process.env.TOKEN_JSON) {
-    try {
-      const custom = JSON.parse(process.env.TOKEN_JSON);
-      if (Array.isArray(custom)) merged = merged.concat(custom);
-    } catch (err) {
-      console.warn("⚠️ TOKEN_JSON parse error:", err.message);
-    }
-  }
-  if (fs.existsSync(EXTRA_TOKENS_FILE)) {
-    try {
-      const extra = JSON.parse(fs.readFileSync(EXTRA_TOKENS_FILE, "utf8"));
-      if (Array.isArray(extra)) merged = merged.concat(extra);
-    } catch (err) {
-      console.warn("⚠️ Failed to read extra_tokens.json:", err.message);
-    }
-  }
-  const seen = new Set();
-  return merged.filter(t => {
-    const key = (t.asset || "").toLowerCase();
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return Boolean(t.symbol) && typeof t.decimals === "number";
-  });
-}
-
-const TOKENS = loadTokens();
-
 const ROUTERS = [
-  { name: "QuickSwapV2", address: "0xa5e0829caced8ffdd4de3c43696c57f7d7a678ff" },
-  { name: "SushiV2",     address: "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506" },
-  { name: "DfynV2",      address: "0x5be02eb3c3ce3ec483d0d3ce0fc284e7370f9ea0" }
+  { name: "QuickSwapV2", address: "0xa5e0829caced8ffdd4de3c43696c57f7d7a678ff", type: "v2" },
+  { name: "SushiV2", address: "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506", type: "v2" },
+  { name: "1inch", address: "0x1111111254EEB25477B68fb85Ed929f73A960582", type: "1inch" },
+  { name: "Paraswap", address: "0xDEF171Fe48CF0115B1d80b88Fb4041C0e2347b4F", type: "paraswap" }
 ];
 
 const CURVE_POOLS = [
-  { name: "CurveAavePool", address: "0x445FE580eF8d70FF569aB36e80c647af338db351", coins: [
-    "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063","0x2791bca1f2de4661ed88a30c99a7a9449aa84174","0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
-  ]},
-  { name: "CurveAtricrypto3", address: "0x8e0B8c8BB9db49a46697F3a5Bb8A308e744821D2", coins: [
-    "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063","0x2791bca1f2de4661ed88a30c99a7a9449aa84174","0xc2132d05d31c914a87c6611c10748aeb04b58e8f","0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6","0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"
-  ]}
+  {
+    name: "CurveAavePool",
+    address: "0x445FE580eF8d70FF569aB36e80c647af338db351",
+    coins: [
+      "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
+      "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+      "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
+    ]
+  },
+  {
+    name: "CurveAtricrypto3",
+    address: "0x8e0B8c8BB9db49a46697F3a5Bb8A308e744821D2",
+    coins: [
+      "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
+      "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+      "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+      "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6",
+      "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"
+    ]
+  }
 ];
 
-const BALANCER_VAULT = {
-  name: "BalancerV2",
-  address: process.env.BALANCER_VAULT_ADDRESS || "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
-  type: "balancer"
-};
-const BALANCER_FEE_BPS = BigInt(process.env.BALANCER_FLASH_FEE_BPS || "9");
+const BALANCER_VAULT = { name: "BalancerV2", address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8", type: "balancer" };
 
 // ======== helpers ========
 function min(a, b) { return a < b ? a : b; }
-function formatUnits(bi, dec) { try { return ethers.formatUnits(bi, dec); } catch (_) { return bi.toString(); } }
-function toLower(addr) { return (addr || "").toLowerCase(); }
-function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+function formatUnits(bi, dec) {
+  try {
+    return ethers.formatUnits(bi, dec);
+  } catch (_) {
+    return bi.toString();
+  }
+}
+function toLower(addr) { return addr.toLowerCase(); }
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-function buildRouters(provider) {
+function buildRouters(currentProvider) {
   return ROUTERS.map(r => ({
-    name: r.name, address: r.address, type: "v2",
-    contract: new ethers.Contract(r.address, V2_ROUTER_ABI, provider)
+    name: r.name,
+    address: r.address,
+    type: r.type,
+    contract: new ethers.Contract(
+      r.address,
+      r.type === "v2" ? V2_ROUTER_ABI : r.type === "1inch" ? I1INCH_ABI : [],
+      currentProvider
+    )
   }));
 }
-function buildCurvePools(provider) {
+
+function buildCurvePools(currentProvider) {
   return CURVE_POOLS.map(p => ({
-    name: p.name, address: p.address, type: "curve", coins: p.coins,
-    contract: new ethers.Contract(p.address, CURVE_POOL_ABI, provider)
+    name: p.name,
+    address: p.address,
+    type: "curve",
+    coins: p.coins,
+    contract: new ethers.Contract(p.address, CURVE_POOL_ABI, currentProvider)
   }));
 }
-function buildBalancer(provider) {
+
+function buildBalancer(currentProvider) {
   return {
-    name: BALANCER_VAULT.name,
+    name: "BalancerV2",
     address: BALANCER_VAULT.address,
     type: "balancer",
-    contract: new ethers.Contract(BALANCER_VAULT.address, BALANCER_VAULT_ABI, provider)
+    contract: new ethers.Contract(BALANCER_VAULT.address, BALANCER_VAULT_ABI, currentProvider)
   };
 }
 
 function generatePaths(tokenIn, tokenOut) {
-  const a = toLower(tokenIn), b = toLower(tokenOut);
+  const a = toLower(tokenIn);
+  const b = toLower(tokenOut);
   const paths = [];
   if (a !== b) paths.push([a, b]);
-  const hubs = new Set([toLower(WMATIC), ...TOKENS.map(t => toLower(t.asset))]);
-  for (const hub of hubs) {
+  for (const h of [WMATIC, ...TOKENS.map(t => t.asset)]) {
+    const hub = toLower(h);
     if (hub !== a && hub !== b) paths.push([a, hub, b]);
   }
   return paths;
-}
-
-function buildVenueLookup(venues) {
-  const map = {};
-  for (const venue of venues) map[venue.name] = venue;
-  return map;
-}
-
-function venueTypeToCode(type) {
-  if (type === "v2") return 0;
-  if (type === "curve") return 1;
-  return 2; // balancer
-}
-
-function slippageAdjust(value, bps) {
-  const big = BigInt(bps);
-  return value - (value * big) / 10000n;
-}
-
-function computeSizeSchedule(token, available, cfg) {
-  if (available <= 0n) return [];
-  const multiplierBps = BigInt(cfg.stepMultiplierBps || 18000); // 1.8x default
-  const maxSteps = Number(cfg.maxSteps || 5);
-  const maxShareBps = BigInt(cfg.maxShareBps || 250); // 2.5% default
-  let base = ethers.parseUnits(cfg.base || "0.1", token.decimals);
-  const cap = maxShareBps > 0n ? (available * maxShareBps) / 10000n : available;
-  if (cap > 0n) base = min(base, cap);
-  if (base <= 0n) base = cap;
-  if (base <= 0n) return [];
-  const schedule = [];
-  let current = base;
-  for (let i = 0; i < maxSteps; i++) {
-    const capped = cap > 0n ? min(current, cap) : current;
-    if (capped <= 0n) break;
-    if (!schedule.some(v => v === capped)) schedule.push(capped);
-    if (multiplierBps <= 10000n) break;
-    current = (capped * multiplierBps) / 10000n;
-    if (current === capped) break;
-  }
-  return schedule;
-}
-
-function loadYieldOpportunities() {
-  const defaults = [
-    {
-      name: "Stable carry USDC-DAI",
-      asset: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
-      deposit: { venue: "CurveAavePool", path: ["0x2791bca1f2de4661ed88a30c99a7a9449aa84174", "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"] },
-      redeem: { venue: "QuickSwapV2", path: ["0x8f3cf7ad23cd3cadbd9735aff958023239c6a063", "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"] },
-      bonusBps: Number(process.env.DEFAULT_YIELD_BONUS_BPS || 18)
-    },
-    {
-      name: "WMATIC swing via Balancer",
-      asset: WMATIC,
-      deposit: { venue: "BalancerV2", path: [WMATIC, "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"], poolId: process.env.BALANCER_WMATIC_WETH_POOLID || "0x0000000000000000000000000000000000000000000000000000000000000000" },
-      redeem: { venue: "SushiV2", path: ["0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", WMATIC] },
-      bonusBps: Number(process.env.WMATIC_YIELD_BONUS_BPS || 22)
-    }
-  ];
-
-  if (fs.existsSync(YIELD_CONFIG_FILE)) {
-    try {
-      const file = JSON.parse(fs.readFileSync(YIELD_CONFIG_FILE, "utf8"));
-      if (Array.isArray(file) && file.length) return file;
-    } catch (err) {
-      console.warn("⚠️ Failed to parse yield_opportunities.json:", err.message);
-    }
-  }
-  return defaults;
 }
 
 // ======== quoting ========
@@ -518,37 +730,69 @@ async function quoteV2(router, amountIn, path) {
   try {
     const amounts = await router.contract.getAmountsOut(amountIn, path);
     return BigInt(amounts[amounts.length - 1]);
-  } catch (_) { return 0n; }
+  } catch (_) {
+    return 0n;
+  }
 }
 
 async function quoteCurve(pool, amountIn, path) {
   if (path.length !== 2) return { out: 0n, i: -1, j: -1 };
   const coins = pool.coins.map(toLower);
-  const i = coins.indexOf(toLower(path[0]));
-  const j = coins.indexOf(toLower(path[1]));
+  const i = coins.indexOf(path[0]);
+  const j = coins.indexOf(path[1]);
   if (i === -1 || j === -1) return { out: 0n, i, j };
   try {
     const dy = await pool.contract.get_dy(i, j, amountIn);
     return { out: BigInt(dy), i, j };
-  } catch (_) { return { out: 0n, i, j }; }
+  } catch (_) {
+    return { out: 0n, i, j };
+  }
 }
 
-async function quoteBalancer(vault, amountIn, path, opts = {}) {
+async function quoteBalancer(vault, amountIn, path) {
   if (path.length !== 2) return { out: 0n, poolId: "0x00" };
-  const inIdx = 0, outIdx = 1;
-  const poolId = opts.poolId || "0x0000000000000000000000000000000000000000000000000000000000000000";
+  const inIdx = 0;
+  const outIdx = 1;
   try {
+    const poolId = "0x0000000000000000000000000000000000000000000000000000000000000000";
     const swaps = [{ poolId, assetInIndex: inIdx, assetOutIndex: outIdx, amount: amountIn, userData: "0x" }];
     const assets = [path[0], path[1]];
-    const funds = { sender: ethers.ZeroAddress, fromInternalBalance: false, recipient: ethers.ZeroAddress, toInternalBalance: false };
+    const funds = {
+      sender: ethers.ZeroAddress,
+      fromInternalBalance: false,
+      recipient: ethers.ZeroAddress,
+      toInternalBalance: false
+    };
     const deltas = await vault.contract.queryBatchSwap(0, swaps, assets, funds);
     const outDelta = deltas[outIdx];
-    const out = (typeof outDelta === "bigint") ? -outDelta : -(BigInt(outDelta));
+    const out = typeof outDelta === "bigint" ? -outDelta : -BigInt(outDelta);
     return { out: out > 0n ? out : 0n, poolId };
-  } catch (_) { return { out: 0n, poolId }; }
+  } catch (_) {
+    return { out: 0n, poolId: "0x00" };
+  }
 }
 
-async function quoteVenue(venue, amountIn, path, opts = {}) {
+async function quote1Inch(router, amountIn, path) {
+  try {
+    const pools = [1];
+    const minReturn = 0;
+    const returnAmount = await router.contract.swap.staticCall(
+      path[0],
+      path[1],
+      amountIn,
+      minReturn,
+      pools,
+      0,
+      ethers.ZeroAddress,
+      { value: 0 }
+    );
+    return BigInt(returnAmount);
+  } catch (_) {
+    return 0n;
+  }
+}
+
+async function quoteVenue(venue, amountIn, path) {
   if (venue.type === "v2") {
     const out = await quoteV2(venue, amountIn, path);
     return { out, meta: {} };
@@ -558,10 +802,19 @@ async function quoteVenue(venue, amountIn, path, opts = {}) {
     return { out: q.out, meta: { curveI: q.i, curveJ: q.j } };
   }
   if (venue.type === "balancer") {
-    const q = await quoteBalancer(venue, amountIn, path, opts);
+    const q = await quoteBalancer(venue, amountIn, path);
     return { out: q.out, meta: { poolId: q.poolId } };
   }
+  if (venue.type === "1inch") {
+    const out = await quote1Inch(venue, amountIn, path);
+    return { out, meta: {} };
+  }
   return { out: 0n, meta: {} };
+}
+
+function applySlippage(x) {
+  const SLIPPAGE_BPS = 30n;
+  return x - (x * SLIPPAGE_BPS) / 10000n;
 }
 
 // ======== profit persistence ========
@@ -571,14 +824,14 @@ function loadProfitState() {
       const obj = JSON.parse(fs.readFileSync(PROFIT_JSON, "utf8"));
       return obj && typeof obj === "object" ? obj : {};
     }
-  } catch (err) {
-    console.warn("⚠️ Failed to load profit state:", err.message);
-  }
+  } catch (_) {}
   return {};
 }
 
 function saveProfitState(state) {
-  try { fs.writeFileSync(PROFIT_JSON, JSON.stringify(state)); } catch (_) {}
+  try {
+    fs.writeFileSync(PROFIT_JSON, JSON.stringify(state));
+  } catch (_) {}
 }
 
 function appendProfitCSV(ts, symbol, amountStr) {
@@ -589,395 +842,315 @@ function appendProfitCSV(ts, symbol, amountStr) {
   } catch (_) {}
 }
 
-// ======== strategies ========
-const YIELD_OPPORTUNITIES = loadYieldOpportunities();
-
-const STRATEGIES = [
-  {
-    name: "flash-arbitrage",
-    lender: "aave",
-    minEdgeBps: BigInt(process.env.ARB_MIN_EDGE_BPS || "25"),
-    bufferBps: BigInt(process.env.ARB_EXTRA_BUFFER_BPS || "28"),
-    cooldownRounds: Number(process.env.ARB_COOLDOWN_ROUNDS || 3),
-    sizeConfig: {
-      base: process.env.ARB_BASE_SIZE || "0.25",
-      stepMultiplierBps: Number(process.env.ARB_STEP_MULTIPLIER_BPS || 17500),
-      maxSteps: Number(process.env.ARB_MAX_STEPS || 5),
-      maxShareBps: Number(process.env.ARB_MAX_SHARE_BPS || 350)
-    }
-  },
-  {
-    name: "flash-yield",
-    lender: "balancer",
-    minBoostBps: BigInt(process.env.YIELD_MIN_BOOST_BPS || "15"),
-    bufferBps: BigInt(process.env.YIELD_EXTRA_BUFFER_BPS || "20"),
-    cooldownRounds: Number(process.env.YIELD_COOLDOWN_ROUNDS || 4),
-    sizeConfig: {
-      base: process.env.YIELD_BASE_SIZE || "0.5",
-      stepMultiplierBps: Number(process.env.YIELD_STEP_MULTIPLIER_BPS || 16000),
-      maxSteps: Number(process.env.YIELD_MAX_STEPS || 4),
-      maxShareBps: Number(process.env.YIELD_MAX_SHARE_BPS || 200)
-    }
-  }
-];
-
-function describePlan(strategy, token, size, owed, expectedOut, venueA, venueB, edgeBps) {
-  console.log(
-    `🔎 [${strategy}] ${token.symbol} size ${formatUnits(size, token.decimals)} ` +
-    `via ${venueA} → ${venueB} out ${formatUnits(expectedOut, token.decimals)} owed ${formatUnits(owed, token.decimals)} edge ${edgeBps} bps`
+// ======== Flashbots MEV protection ========
+async function sendWithFlashbots(tx) {
+  const flashbotProvider = await FlashbotsBundleProvider.create(
+    provider,
+    wallet,
+    FLASHBOTS_ENDPOINT
   );
-}
-
-async function prepareArbitragePlan(ctx, token, size, premiumBps, strategy) {
-  const owed = size + (size * premiumBps) / 10000n;
-  const venues = ctx.venues;
-  const paths1 = generatePaths(token.asset, TARGET);
-  const paths2 = generatePaths(TARGET, token.asset);
-  let best = null;
-
-  for (const path1 of paths1) {
-    for (const path2 of paths2) {
-      for (const venueA of venues) {
-        const quote1 = await quoteVenue(venueA, size, path1);
-        if (quote1.out <= 0n) continue;
-        for (const venueB of venues) {
-          const quote2 = await quoteVenue(venueB, quote1.out, path2);
-          if (quote2.out <= 0n) continue;
-          if (!best || quote2.out > best.out2) {
-            best = {
-              venueA,
-              venueB,
-              path1,
-              path2,
-              out1: quote1.out,
-              out2: quote2.out,
-              metaA: quote1.meta,
-              metaB: quote2.meta
-            };
-          }
-        }
-      }
+  const bundle = [
+    {
+      transaction: tx,
+      signer: wallet
     }
-  }
-
-  if (!best || best.out2 <= owed) return null;
-
-  const delta = best.out2 - owed;
-  const edgeBps = (delta * 10000n) / owed;
-  if (edgeBps < strategy.minEdgeBps) return null;
-
-  const buffer = (owed * strategy.bufferBps) / 10000n;
-  if (best.out2 < owed + buffer) return null;
-
-  describePlan(strategy.name, token, size, owed, best.out2, best.venueA.name, best.venueB.name, edgeBps.toString());
-
-  const plan = {
-    lender: "aave",
-    strategy: strategy.name,
-    token,
-    size,
-    owed,
-    venueA: best.venueA,
-    venueB: best.venueB,
-    path1: best.path1,
-    path2: best.path2,
-    typeA: venueTypeToCode(best.venueA.type),
-    typeB: venueTypeToCode(best.venueB.type),
-    minOut1: slippageAdjust(best.out1, ctx.slippageBps),
-    minOut2: slippageAdjust(best.out2, ctx.slippageBps),
-    curveI1: BigInt(best.metaA.curveI ?? 0),
-    curveJ1: BigInt(best.metaA.curveJ ?? 1),
-    curveI2: BigInt(best.metaB.curveI ?? 0),
-    curveJ2: BigInt(best.metaB.curveJ ?? 1),
-    balPidA: best.metaA.poolId || ethers.ZeroHash,
-    balPidB: best.metaB.poolId || ethers.ZeroHash,
-    expectedOut: best.out2,
-    expectedProfit: delta,
-    premiumBps
-  };
-  return plan;
-}
-
-async function prepareYieldPlan(ctx, token, size, premiumBps, strategy) {
-  const opportunities = YIELD_OPPORTUNITIES.filter(op => toLower(op.asset) === toLower(token.asset));
-  if (!opportunities.length) return null;
-  const owed = size + (size * premiumBps) / 10000n;
-  let best = null;
-
-  for (const op of opportunities) {
-    const depositVenue = ctx.venueLookup[op.deposit.venue];
-    const redeemVenue = ctx.venueLookup[op.redeem.venue];
-    if (!depositVenue || !redeemVenue) continue;
-
-    const depositQuote = await quoteVenue(depositVenue, size, op.deposit.path, op.deposit);
-    if (depositQuote.out <= 0n) continue;
-
-    let working = depositQuote.out;
-    const bonusBps = BigInt(op.bonusBps || 0);
-    if (bonusBps > 0n) working += (working * bonusBps) / 10000n;
-
-    const redeemQuote = await quoteVenue(redeemVenue, working, op.redeem.path, op.redeem);
-    if (redeemQuote.out <= 0n) continue;
-
-    const boost = redeemQuote.out - owed;
-    if (boost <= 0n) continue;
-    const boostBps = (boost * 10000n) / owed;
-    if (boostBps < strategy.minBoostBps) continue;
-
-    if (!best || redeemQuote.out > best.out2) {
-      best = {
-        op,
-        venueA: depositVenue,
-        venueB: redeemVenue,
-        path1: op.deposit.path.map(toLower),
-        path2: op.redeem.path.map(toLower),
-        out1: depositQuote.out,
-        out2: redeemQuote.out,
-        metaA: depositQuote.meta,
-        metaB: redeemQuote.meta,
-        boostBps
-      };
-    }
-  }
-
-  if (!best) return null;
-
-  const buffer = (owed * strategy.bufferBps) / 10000n;
-  if (best.out2 < owed + buffer) return null;
-
-  describePlan(strategy.name, token, size, owed, best.out2, best.venueA.name, best.venueB.name, best.boostBps.toString());
-
-  return {
-    lender: "balancer",
-    strategy: strategy.name,
-    token,
-    size,
-    owed,
-    venueA: best.venueA,
-    venueB: best.venueB,
-    path1: best.path1,
-    path2: best.path2,
-    typeA: venueTypeToCode(best.venueA.type),
-    typeB: venueTypeToCode(best.venueB.type),
-    minOut1: slippageAdjust(best.out1, ctx.slippageBps),
-    minOut2: slippageAdjust(best.out2, ctx.slippageBps),
-    curveI1: BigInt(best.metaA.curveI ?? 0),
-    curveJ1: BigInt(best.metaA.curveJ ?? 1),
-    curveI2: BigInt(best.metaB.curveI ?? 0),
-    curveJ2: BigInt(best.metaB.curveJ ?? 1),
-    balPidA: best.metaA.poolId || ethers.ZeroHash,
-    balPidB: best.metaB.poolId || ethers.ZeroHash,
-    expectedOut: best.out2,
-    expectedProfit: best.out2 - owed,
-    premiumBps
-  };
-}
-
-async function executePlan(ctx, plan) {
-  const contract = ctx.flashBot;
-  const args = [
-    plan.token.asset,
-    plan.size,
-    plan.typeA === 2 ? BALANCER_VAULT.address : plan.venueA.address,
-    plan.typeB === 2 ? BALANCER_VAULT.address : plan.venueB.address,
-    plan.path1,
-    plan.path2,
-    plan.minOut1,
-    plan.minOut2,
-    plan.typeA,
-    plan.typeB,
-    plan.balPidA,
-    plan.balPidB,
-    plan.curveI1,
-    plan.curveJ1,
-    plan.curveI2,
-    plan.curveJ2,
-    { gasLimit: 2_400_000 }
   ];
-
-  const fn = plan.lender === "balancer"
-    ? "initiateBalancerFlashLoanMulti(address,uint256,address,address,address[],address[],uint256,uint256,uint8,uint8,bytes32,bytes32,int128,int128,int128,int128)"
-    : "initiateFlashLoanMulti(address,uint256,address,address,address[],address[],uint256,uint256,uint8,uint8,bytes32,bytes32,int128,int128,int128,int128)";
-
-  console.log(`💡 Executing ${plan.strategy} with ${plan.token.symbol}`);
-  const tx = await contract[fn](...args);
-  console.log("🚀 TX sent:", tx.hash);
-  const receipt = await tx.wait();
-  console.log("✅ Included in block", receipt.blockNumber);
-
-  const fullReceipt = await ctx.provider.getTransactionReceipt(tx.hash);
-  let netGain = 0n;
-  for (const log of fullReceipt.logs) {
-    try {
-      const parsed = ctx.iface.parseLog(log);
-      if (parsed && parsed.name === "Profit") {
-        netGain = BigInt(parsed.args.netGain.toString());
-      }
-    } catch (_) {}
+  const blockNumber = await provider.getBlockNumber();
+  const simulation = await flashbotProvider.simulate(bundle, blockNumber + 1);
+  if ("error" in simulation) {
+    console.error("❌ Flashbots simulation failed:", simulation.error);
+    return null;
   }
-  return netGain;
+  const bundleResponse = await flashbotProvider.sendBundle(bundle, blockNumber + 1);
+  return bundleResponse;
 }
 
 // ======== main loop ========
-(async () => {
-  const deployed = await deploy(false);
-  let flashBot = new ethers.Contract(deployed.address, deployed.abi, wallet);
-  let iface = new ethers.Interface(deployed.abi);
+const main = async () => {
+  let lastRpcSwitch = 0;
+  const RPC_SWITCH_COOLDOWN = 5000;
+  let providerContract;
+  try {
+    const deployed = await deploy(false);
+    const flashBot = new ethers.Contract(deployed.address, deployed.abi, wallet);
+    const iface = new ethers.Interface(deployed.abi);
+    providerContract = new ethers.Contract(AAVE_PROVIDER_ADDRESS, PROVIDER_ABI, provider);
 
-  let providerContract = new ethers.Contract(process.env.AAVE_POOL_ADDRESSES_PROVIDER, PROVIDER_ABI, provider);
-
-  async function rebuildVenues() {
-    const routers = buildRouters(provider);
-    const curvePools = buildCurvePools(provider);
-    const balancer = buildBalancer(provider);
-    return { routers, curvePools, balancer, all: [...routers, ...curvePools, balancer] };
-  }
-
-  async function getPoolAddr() {
-    try { return await providerContract.getPool(); }
-    catch (_) {
-      await rotateAndRebuild();
-      return providerContract.getPool();
+    async function getPoolAddr() {
+      try {
+        return await providerContract.getPool();
+      } catch (error) {
+        console.warn("⚠️ Failed to get pool address, rotating RPC...");
+        provider = await rotateRPC();
+        wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+        providerContract = new ethers.Contract(AAVE_PROVIDER_ADDRESS, PROVIDER_ABI, provider);
+        return providerContract.getPool();
+      }
     }
-  }
 
-  async function getPremiumBps(poolAddr) {
-    try {
-      const pool = new ethers.Contract(poolAddr, POOL_ABI, provider);
-      return BigInt(await pool.FLASHLOAN_PREMIUM_TOTAL());
-    } catch (_) {
-      console.warn("⚠️ Could not read FLASHLOAN_PREMIUM_TOTAL, defaulting to 9 bps");
-      return 9n;
+    async function getPremiumBps(poolAddr) {
+      try {
+        const pool = new ethers.Contract(poolAddr, POOL_ABI, provider);
+        return BigInt(await pool.FLASHLOAN_PREMIUM_TOTAL());
+      } catch (_) {
+        console.warn("⚠️ Could not read FLASHLOAN_PREMIUM_TOTAL, defaulting to 9 bps");
+        return 9n;
+      }
     }
-  }
 
-  async function rotateAndRebuild() {
-    provider = rotateRPC();
-    wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-    flashBot = new ethers.Contract(deployed.address, deployed.abi, wallet);
-    iface = new ethers.Interface(deployed.abi);
-    providerContract = new ethers.Contract(process.env.AAVE_POOL_ADDRESSES_PROVIDER, PROVIDER_ABI, provider);
-    const venues = await rebuildVenues();
-    ctx.venues = venues.all;
-    ctx.venueLookup = buildVenueLookup(venues.all);
-    ctx.flashBot = flashBot;
-    ctx.provider = provider;
-  }
+    let poolAddr = await getPoolAddr();
+    let premiumBps = await getPremiumBps(poolAddr);
+    let routers = buildRouters(provider);
+    let curvePools = buildCurvePools(provider);
+    let balancer = buildBalancer(provider);
+    const cooldown = new Map();
+    let round = 0;
+    const profitState = loadProfitState();
+    console.log("🔄 Starting bot...");
 
-  const ctx = {
-    provider,
-    wallet,
-    flashBot,
-    iface,
-    venues: [],
-    venueLookup: {},
-    slippageBps: Number(process.env.SLIPPAGE_BPS || 30)
-  };
-
-  const venueBundle = await rebuildVenues();
-  ctx.venues = venueBundle.all;
-  ctx.venueLookup = buildVenueLookup(venueBundle.all);
-
-  let poolAddr = await getPoolAddr();
-  let premiumBps = await getPremiumBps(poolAddr);
-
-  const cooldown = new Map();
-  const profitState = loadProfitState();
-  let round = 0;
-
-  console.log("🔄 Starting bot with", TOKENS.length, "tokens and", STRATEGIES.length, "strategies...");
-
-  async function getAvailable(token) {
-    const contract = new ethers.Contract(token.asset, ERC20_ABI, provider);
-    return BigInt(await contract.balanceOf(poolAddr));
-  }
-
-  while (true) {
-    round++;
-    const liquidityCache = new Map();
-
-    for (const strategy of STRATEGIES) {
+    while (true) {
+      round++;
       for (const token of TOKENS) {
-        const tokenKey = `${strategy.name}:${toLower(token.asset)}`;
-        if (toLower(token.asset) === TARGET) continue;
-        const unlock = cooldown.get(tokenKey) || 0;
+        const assetL = token.asset.toLowerCase();
+        if (assetL === TARGET) continue;
+        const unlock = cooldown.get(assetL) || 0;
         if (round < unlock) continue;
-
-        let available;
+        const underlying = new ethers.Contract(token.asset, ERC20_ABI, provider);
+        let available = 0n;
         try {
-          if (liquidityCache.has(token.asset)) {
-            available = liquidityCache.get(token.asset);
-          } else {
-            available = await getAvailable(token);
-            liquidityCache.set(token.asset, available);
-          }
-        } catch (err) {
-          console.warn(`⚠️ Failed to fetch liquidity for ${token.symbol}:`, err.message);
-          await rotateAndRebuild();
-          try {
-            poolAddr = await getPoolAddr();
-            premiumBps = await getPremiumBps(poolAddr);
-          } catch (_) {}
-          available = 0n;
+          available = await underlying.balanceOf(poolAddr);
+        } catch (error) {
+          console.warn("⚠️ Failed to get balance:", error.message);
+          continue;
         }
-
-        if (!available || available <= 0n) continue;
-
-        const schedule = computeSizeSchedule(token, available, strategy.sizeConfig);
-        if (!schedule.length) continue;
-
-        let executed = false;
-
-        for (const size of schedule) {
-          const premium = strategy.lender === "aave" ? premiumBps : BALANCER_FEE_BPS;
-          let plan = null;
-          if (strategy.lender === "aave") {
-            plan = await prepareArbitragePlan(ctx, token, size, premium, strategy);
-          } else {
-            plan = await prepareYieldPlan(ctx, token, size, premium, strategy);
-          }
-
-          if (!plan) continue;
-
+        if (available <= 0n) {
+          continue;
+        }
+        const now = Date.now();
+        if (now - lastRpcSwitch > RPC_SWITCH_COOLDOWN) {
+          console.warn("🔁 No success this round, rotating RPC and retrying...");
           try {
-            const netGain = await executePlan(ctx, plan);
+            provider = await rotateRPC();
+            wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+            routers = buildRouters(provider);
+            curvePools = buildCurvePools(provider);
+            balancer = buildBalancer(provider);
+            providerContract = new ethers.Contract(AAVE_PROVIDER_ADDRESS, PROVIDER_ABI, provider);
+            lastRpcSwitch = now;
+            await sleep(1000);
+            try {
+              poolAddr = await getPoolAddr();
+              premiumBps = await getPremiumBps(poolAddr);
+            } catch (error) {
+              console.warn("⚠️ Failed to update pool info after RPC rotation:", error.message);
+              continue;
+            }
+          } catch (error) {
+            console.error("❌ Failed to rotate RPC:", error.message);
+            await sleep(5000);
+            continue;
+          }
+        } else {
+          console.warn("⏳ Waiting for RPC cooldown...");
+          await sleep(2000);
+        }
+        const ramp = [
+          "USDC",
+          "USDT",
+          "DAI"
+        ].includes(token.symbol)
+          ? ["0.01", "0.05", "0.1"]
+          : ["0.1", "0.5", "1.0"];
+        const maxCap = available / 10000n;
+        let executed = false;
+        let foundProfitable = false;
+        for (const step of ramp) {
+          let size = ethers.parseUnits(step, token.decimals);
+          size = min(size, maxCap);
+          if (size <= 0n) continue;
+          const premium = (size * premiumBps) / 10000n;
+          const owed = size + premium;
+          const venues = routers.concat(curvePools).concat([balancer]);
+          let best = { out2: 0n };
+          const paths1 = generatePaths(token.asset, TARGET_ADDRESS);
+          const paths2 = generatePaths(TARGET_ADDRESS, token.asset);
+          for (const path1 of paths1) {
+            for (const path2 of paths2) {
+              for (const rA of venues) {
+                const q1 = await quoteVenue(rA, size, path1);
+                if (q1.out <= 0n) continue;
+                for (const rB of venues) {
+                  const q2 = await quoteVenue(rB, q1.out, path2);
+                  if (q2.out <= 0n) continue;
+                  if (q2.out > best.out2) {
+                    best = {
+                      aName: rA.name,
+                      bName: rB.name,
+                      aAddr: rA.address,
+                      bAddr: rB.address,
+                      aType: rA.type,
+                      bType: rB.type,
+                      path1,
+                      path2,
+                      out1: q1.out,
+                      out2: q2.out,
+                      aMeta: q1.meta || {},
+                      bMeta: q2.meta || {}
+                    };
+                  }
+                }
+              }
+            }
+          }
+          if (best.out2 <= 0n) continue;
+          const extra = (owed * 30n) / 10000n;
+          const delta = best.out2 - owed;
+          const edgeBps =
+            delta > 0n
+              ? (delta * 10000n) / owed
+              : -((owed - best.out2) * 10000n) / owed;
+          console.log(
+            "🔎 " +
+              token.symbol +
+              " size " +
+              formatUnits(size, token.decimals) +
+              " via " +
+              best.aName +
+              " → " +
+              best.bName +
+              " out " +
+              formatUnits(best.out2, token.decimals) +
+              " owed " +
+              formatUnits(owed, token.decimals) +
+              " edge " +
+              edgeBps.toString() +
+              " bps"
+          );
+          if (best.out2 < owed + extra) continue;
+          foundProfitable = true;
+          const minOut1 = applySlippage(best.out1);
+          const minOut2 = applySlippage(best.out2);
+          const typeA =
+            best.aType === "v2"
+              ? 0
+              : best.aType === "curve"
+              ? 1
+              : best.aType === "balancer"
+              ? 2
+              : 3;
+          const typeB =
+            best.bType === "v2"
+              ? 0
+              : best.bType === "curve"
+              ? 1
+              : best.bType === "balancer"
+              ? 2
+              : 3;
+          const routerA = typeA === 2 ? BALANCER_VAULT.address : best.aAddr;
+          const routerB = typeB === 2 ? BALANCER_VAULT.address : best.bAddr;
+          const curveI1 = BigInt(best.aMeta.curveI ?? 0);
+          const curveJ1 = BigInt(best.aMeta.curveJ ?? 1);
+          const curveI2 = BigInt(best.bMeta.curveI ?? 0);
+          const curveJ2 = BigInt(best.bMeta.curveJ ?? 1);
+          const balPidA =
+            best.aMeta.poolId ??
+            "0x0000000000000000000000000000000000000000000000000000000000000000";
+          const balPidB =
+            best.bMeta.poolId ??
+            "0x0000000000000000000000000000000000000000000000000000000000000000";
+          try {
+            console.log("💡 Attempting flash loan for " + token.symbol);
+            const tx = await flashBot[
+              "initiateFlashLoanMulti(address,uint256,address,address,address[],address[],uint256,uint256,uint8,uint8,bytes32,bytes32,int128,int128,int128,int128)"
+            ](
+              token.asset,
+              size,
+              routerA,
+              routerB,
+              best.path1,
+              best.path2,
+              minOut1,
+              minOut2,
+              typeA,
+              typeB,
+              balPidA,
+              balPidB,
+              curveI1,
+              curveJ1,
+              curveI2,
+              curveJ2,
+              { gasLimit: 2_200_000 }
+            );
+            console.log("🚀 TX sent: " + tx.hash);
+            const flashbotsResponse = await sendWithFlashbots(tx);
+            if (!flashbotsResponse) {
+              console.error("❌ Flashbots submission failed");
+              continue;
+            }
+            console.log("✅ Flashbots bundle submitted:", flashbotsResponse.bundleHash);
+            const rec = await tx.wait();
+            console.log("✅ Executed in block " + rec.blockNumber);
+            let netGain = 0n;
+            const receipt = await provider.getTransactionReceipt(tx.hash);
+            for (const log of receipt.logs) {
+              try {
+                const parsed = iface.parseLog(log);
+                if (parsed && parsed.name === "Profit") {
+                  netGain = BigInt(parsed.args.netGain.toString());
+                }
+              } catch (_) {}
+            }
             if (netGain > 0n) {
               const ts = new Date().toISOString();
-              const key = `${token.symbol}:${strategy.name}`;
+              const key = token.symbol;
               const prev = profitState[key] ? BigInt(profitState[key]) : 0n;
               const next = prev + netGain;
               profitState[key] = next.toString();
               saveProfitState(profitState);
-              appendProfitCSV(ts, `${token.symbol}-${strategy.name}`, formatUnits(netGain, token.decimals));
-              console.log(`💰 Profit ${token.symbol} (${strategy.name}): +${formatUnits(netGain, token.decimals)} | total ${formatUnits(next, token.decimals)}`);
+              appendProfitCSV(ts, key, formatUnits(netGain, token.decimals));
+              console.log(
+                "💰 Profit " +
+                  key +
+                  ": +" +
+                  formatUnits(netGain, token.decimals) +
+                  " | total " +
+                  formatUnits(next, token.decimals)
+              );
             } else {
-              console.log("ℹ️ Strategy executed without net profit (<= 0)");
+              console.log("ℹ️ No profit recorded (<= 0)");
             }
             executed = true;
-            cooldown.set(tokenKey, round + strategy.cooldownRounds);
             break;
-          } catch (err) {
-            const msg = err && (err.reason || err.shortMessage || err.message) || String(err);
-            console.warn(`❌ ${strategy.name} tx failed for ${token.symbol}:`, msg);
+          } catch (e) {
+            const msg = (e && (e.reason || e.shortMessage || e.message)) || String(e);
+            console.warn("❌ TX failed for " + token.symbol + ": " + msg);
           }
         }
-
-        if (!executed) {
-          const wait = strategy.cooldownRounds + 1;
-          console.log(`ℹ️ Cooling ${token.symbol} (${strategy.name}) for ${wait} rounds`);
-          cooldown.set(tokenKey, round + wait);
+        if (executed) {
+          await sleep(1200);
+          continue;
+        }
+        if (!foundProfitable) {
+          cooldown.set(assetL, round + 1);
         }
       }
+      try {
+        poolAddr = await getPoolAddr();
+      } catch (error) {
+        console.error("❌ Failed to get pool address:", error.message);
+        await sleep(5000);
+      }
+      try {
+        premiumBps = await getPremiumBps(poolAddr);
+      } catch (error) {
+        console.error("❌ Failed to get premium bps:", error.message);
+        await sleep(5000);
+      }
+      await sleep(1500);
     }
-
-    console.warn("🔁 Cycle complete, rotating RPC for fresh data...");
-    await rotateAndRebuild();
-    try {
-      poolAddr = await getPoolAddr();
-      premiumBps = await getPremiumBps(poolAddr);
-    } catch (err) {
-      console.warn("⚠️ Failed to refresh pool data:", err.message);
-    }
-    await sleep(Number(process.env.ROUND_SLEEP_MS || 1500));
+  } catch (error) {
+    console.error("❌ Initialization failed:", error.message);
+    process.exit(1);
   }
-})();
+};
+
