@@ -28,34 +28,7 @@ if (!process.env.TARGET_TOKEN) {
   process.exit(1);
 }
 
-function normalizeAddress(value, envName) {
-  const addr = (value || "").trim();
-  if (!addr) {
-    console.error(`Missing ${envName} value`);
-    process.exit(1);
-  }
-  try {
-    return ethers.getAddress(addr);
-  } catch (error) {
-    try {
-      const lowered = addr.toLowerCase();
-      const checksummed = ethers.getAddress(lowered);
-      console.warn(`⚠️ ${envName} not checksummed, normalized to ${checksummed}`);
-      return checksummed;
-    } catch (inner) {
-      console.error(`Invalid address for ${envName}: ${addr}`);
-      console.error(inner.message || inner);
-      process.exit(1);
-    }
-  }
-}
-
-const AAVE_PROVIDER_ADDRESS = normalizeAddress(
-  process.env.AAVE_POOL_ADDRESSES_PROVIDER,
-  "AAVE_POOL_ADDRESSES_PROVIDER"
-);
-const TARGET_ADDRESS = normalizeAddress(process.env.TARGET_TOKEN, "TARGET_TOKEN");
-const TARGET = TARGET_ADDRESS.toLowerCase();
+const TARGET = process.env.TARGET_TOKEN.toLowerCase();
 const ADDRESS_FILE = "FlashBotArb.address.txt";
 const PROFIT_JSON = "profit_per_token.json";
 const PROFIT_CSV = "profit_per_token.csv";
@@ -406,9 +379,9 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase, IFlashLoanRecipient {
             }
         } else if (pTypeA == 1) {
             safeApprove(IERC20(asset), pRouterA, amount);
-            try ICurvePool(pRouterA).exchange(pCurveI1, pCurveJ1, amount, pMinOut1) returns (uint256 returnedAmount) {
-                out1 = returnedAmount;
-            }
+            try ICurvePool(pRouterA).exchange(pCurveI1, pCurveJ1, amount, pMinOut1) {
+                out1 = IERC20(pPath1[pPath1.length - 1]).balanceOf(address(this));
+            } catch Error(string memory reason) {
                 emit SwapFailed(pRouterA, reason);
                 revert(string(abi.encodePacked("Curve swap failed: ", reason)));
             } catch (bytes memory) {
@@ -610,7 +583,7 @@ async function deploy(force) {
   }
   console.log("🚀 Deploying FlashBotArb...");
   const factory = new ethers.ContractFactory(abi, bytecode, wallet);
-  const flashBot = await factory.deploy(AAVE_PROVIDER_ADDRESS);
+  const flashBot = await factory.deploy(process.env.AAVE_POOL_ADDRESSES_PROVIDER);
   await flashBot.waitForDeployment();
   const deployedAddress = await flashBot.getAddress();
   fs.writeFileSync(ADDRESS_FILE, deployedAddress);
@@ -874,7 +847,11 @@ const main = async () => {
     const deployed = await deploy(false);
     const flashBot = new ethers.Contract(deployed.address, deployed.abi, wallet);
     const iface = new ethers.Interface(deployed.abi);
-    providerContract = new ethers.Contract(AAVE_PROVIDER_ADDRESS, PROVIDER_ABI, provider);
+    providerContract = new ethers.Contract(
+      process.env.AAVE_POOL_ADDRESSES_PROVIDER,
+      PROVIDER_ABI,
+      provider
+    );
 
     async function getPoolAddr() {
       try {
@@ -883,7 +860,11 @@ const main = async () => {
         console.warn("⚠️ Failed to get pool address, rotating RPC...");
         provider = await rotateRPC();
         wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-        providerContract = new ethers.Contract(AAVE_PROVIDER_ADDRESS, PROVIDER_ABI, provider);
+        providerContract = new ethers.Contract(
+          process.env.AAVE_POOL_ADDRESSES_PROVIDER,
+          PROVIDER_ABI,
+          provider
+        );
         return providerContract.getPool();
       }
     }
@@ -935,7 +916,11 @@ const main = async () => {
             routers = buildRouters(provider);
             curvePools = buildCurvePools(provider);
             balancer = buildBalancer(provider);
-            providerContract = new ethers.Contract(AAVE_PROVIDER_ADDRESS, PROVIDER_ABI, provider);
+            providerContract = new ethers.Contract(
+              process.env.AAVE_POOL_ADDRESSES_PROVIDER,
+              PROVIDER_ABI,
+              provider
+            );
             lastRpcSwitch = now;
             await sleep(1000);
             try {
@@ -972,8 +957,8 @@ const main = async () => {
           const owed = size + premium;
           const venues = routers.concat(curvePools).concat([balancer]);
           let best = { out2: 0n };
-          const paths1 = generatePaths(token.asset, TARGET_ADDRESS);
-          const paths2 = generatePaths(TARGET_ADDRESS, token.asset);
+          const paths1 = generatePaths(token.asset, TARGET);
+          const paths2 = generatePaths(TARGET, token.asset);
           for (const path1 of paths1) {
             for (const path2 of paths2) {
               for (const rA of venues) {
