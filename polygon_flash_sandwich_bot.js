@@ -510,18 +510,12 @@ async function getFeeOverrides() {
   }
 
   const feeData = await provider.getFeeData();
-  let priority = feeData.maxPriorityFeePerGas ?? ethers.parseUnits(PRIORITY_FEE_FLOOR_GWEI, 9);
   const floor = ethers.parseUnits(PRIORITY_FEE_FLOOR_GWEI, 9);
-  if (priority < floor) priority = floor;
+  const priority = (feeData.maxPriorityFeePerGas ?? 0n) > floor ? feeData.maxPriorityFeePerGas : floor;
 
-  let maxFee = feeData.maxFeePerGas ?? priority * BigInt(Math.ceil(PRIORITY_FEE_MULTIPLIER));
-  const multiplier = BigInt(Math.ceil(PRIORITY_FEE_MULTIPLIER));
-  if (maxFee < priority) {
-    maxFee = priority;
-  }
-  if (maxFee < priority * multiplier) {
-    maxFee = priority * multiplier;
-  }
+  // Robustly calculate maxFeePerGas using the last base fee.
+  // A common strategy is 2 * base_fee + priority_fee.
+  const maxFee = ((feeData.lastBaseFeePerGas ?? priority) * 2n) + priority;
 
   return { maxFeePerGas: maxFee, maxPriorityFeePerGas: priority };
 }
