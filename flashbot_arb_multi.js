@@ -406,9 +406,9 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase, IFlashLoanRecipient {
             }
         } else if (pTypeA == 1) {
             safeApprove(IERC20(asset), pRouterA, amount);
-            try ICurvePool(pRouterA).exchange(pCurveI1, pCurveJ1, amount, pMinOut1) {
-                out1 = IERC20(pPath1[pPath1.length - 1]).balanceOf(address(this));
-            } catch Error(string memory reason) {
+            try ICurvePool(pRouterA).exchange(pCurveI1, pCurveJ1, amount, pMinOut1) returns (uint256 returnedAmount) {
+                out1 = returnedAmount;
+            }
                 emit SwapFailed(pRouterA, reason);
                 revert(string(abi.encodePacked("Curve swap failed: ", reason)));
             } catch (bytes memory) {
