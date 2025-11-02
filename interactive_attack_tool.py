@@ -18,11 +18,14 @@ def get_attack_mode():
     print("1: Endomorphism Weakness")
     print("2: Isogeny Graph Pathfinding")
     print("3: Lattice Reduction (Private Key Extraction)")
-    try:
-        return int(input("Enter Choice (1/2/3): ").strip())
-    except ValueError:
-        print("[❌] Invalid input. Please enter 1, 2, or 3.")
-        return get_attack_mode()
+    while True:
+        try:
+            choice = int(input("Enter Choice (1/2/3): ").strip())
+            if choice in {1, 2, 3}:
+                return choice
+            print("[❌] Invalid choice. Please enter 1, 2, or 3.")
+        except ValueError:
+            print("[❌] Invalid input. Please enter 1, 2, or 3.")
 
 
 def check_endomorphism():
