@@ -227,8 +227,8 @@ def _integer_matrix_rows(matrix: IntegerMatrix) -> List[List[int]]:
     """Convert an IntegerMatrix to a list of native Python rows."""
 
     rows: List[List[int]] = []
-    nrows = matrix.nrows if isinstance(matrix.nrows, int) else matrix.nrows()
-    ncols = matrix.ncols if isinstance(matrix.ncols, int) else matrix.ncols()
+    nrows = matrix.nrows()
+    ncols = matrix.ncols()
     for i in range(nrows):
         rows.append([int(matrix[i, j]) for j in range(ncols)])
     return rows
