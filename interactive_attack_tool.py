@@ -43,16 +43,19 @@ def create_isogeny_graph():
     import networkx as nx
 
     print("\n[🔹] Constructing Isogeny Graph...")
-    try:
-        graph_size = int(input("Enter Graph Size (Recommended: 50+): ").strip())
-        graph = nx.Graph()
-        for i in range(1, graph_size):
-            graph.add_edge(i, i + 2)
-        print("[✅] Isogeny Graph Created Successfully!")
-        return graph
-    except ValueError:
-        print("[❌] Invalid graph size. Please enter an integer.")
-        return create_isogeny_graph()
+    while True:
+        try:
+            graph_size = int(input("Enter Graph Size (Recommended: 50+): ").strip())
+            if graph_size > 0:
+                graph = nx.Graph()
+                for i in range(1, graph_size):
+                    graph.add_edge(i, i + 2)
+                print("[✅] Isogeny Graph Created Successfully!")
+                return graph
+            else:
+                print("[❌] Graph size must be positive.")
+        except ValueError:
+            print("[❌] Invalid graph size. Please enter an integer.")
 
 
 def find_attack_path(graph):
