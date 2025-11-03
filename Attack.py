@@ -192,14 +192,19 @@ def parse_der_signature(sig: bytes) -> Optional[Tuple[int, int]]:
     if len(sig) < 8 or sig[0] != 0x30:
         return None
     i = 2
-    if sig[i] != 0x02: return None
+    if sig[i] != 0x02:
+        return None
     i += 1
-    r_len = sig[i]; i += 1
-    r = int.from_bytes(sig[i:i+r_len], "big"); i += r_len
-    if sig[i] != 0x02: return None
+    r_len = sig[i]
     i += 1
-    s_len = sig[i]; i += 1
-    s = int.from_bytes(sig[i:i+s_len], "big")
+    r = int.from_bytes(sig[i : i + r_len], "big")
+    i += r_len
+    if sig[i] != 0x02:
+        return None
+    i += 1
+    s_len = sig[i]
+    i += 1
+    s = int.from_bytes(sig[i : i + s_len], "big")
     if 0 < r < CURVE_N and 0 < s < CURVE_N:
         return r, s
     return None
