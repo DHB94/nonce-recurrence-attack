@@ -904,12 +904,6 @@ class AdvancedCryptanalyzer:
             return []
 
         candidates = self._extract_candidates_from_lattice(reduced_matrix)
-        if not candidates:
-            logger.info(
-                "No candidates from reduced lattice, attempting fallback extraction"
-            )
-            candidates = self._extract_candidates_from_raw_matrix(lattice_matrix)
-
         ranked = self.ranker.rank_candidates(candidates)
         validated = self._validate_and_score_candidates(ranked, public_key_hex)
 
@@ -921,59 +915,6 @@ class AdvancedCryptanalyzer:
             len([candidate for candidate in validated if candidate.validation_result]),
         )
         return validated
-
-    def _extract_candidates_from_raw_matrix(
-        self, matrix: List[List[int]]
-    ) -> List[CandidateKey]:
-        """Fallback extraction using the pre-reduction lattice values."""
-
-        candidates: List[CandidateKey] = []
-
-        for row_index, row in enumerate(matrix):
-            if not row:
-                continue
-
-            last_value = abs(row[-1]) % n
-            if 0 < last_value < n:
-                confidence = self._calculate_row_confidence(row, last_value)
-                if confidence > MIN_CONFIDENCE:
-                    candidates.append(
-                        CandidateKey(
-                            key=last_value,
-                            confidence=confidence,
-                            source="raw_lattice_row",
-                            metadata={
-                                "row": row,
-                                "row_index": row_index,
-                                "method": "raw_last_element",
-                            },
-                        )
-                    )
-
-            for element_index, value in enumerate(row[:-1]):
-                candidate = abs(value) % n
-                if not (0 < candidate < n):
-                    continue
-
-                confidence = self._calculate_row_confidence(row, candidate)
-                if confidence <= MIN_CONFIDENCE:
-                    continue
-
-                candidates.append(
-                    CandidateKey(
-                        key=candidate,
-                        confidence=confidence,
-                        source="raw_row_element",
-                        metadata={
-                            "row": row,
-                            "row_index": row_index,
-                            "element_index": element_index,
-                            "method": "raw_element",
-                        },
-                    )
-                )
-
-        return candidates
 
     def _extract_candidates_from_lattice(
         self, lattice_matrix: IntegerMatrix
