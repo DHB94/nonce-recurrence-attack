@@ -42,6 +42,19 @@ warnings.filterwarnings('ignore', message=".*chardet.*")
 
 _original_warn = warnings.warn
 def _silent_warn(message, category=None, *args, **kwargs):
+    """
+    Silence warnings that mention "urllib3" or "chardet".
+    
+    If the provided message is a string containing "urllib3" or "chardet", the warning is suppressed.
+    Otherwise the call is forwarded to the original warning handler.
+    
+    Parameters:
+        message (str or Warning): The warning message or Warning instance to process.
+        category (Optional[type]): Optional warning category passed through to the original handler.
+    
+    Returns:
+        None
+    """
     if isinstance(message, str) and ("urllib3" in message or "chardet" in message):
         return
     _original_warn(message, category, *args, **kwargs)
@@ -112,6 +125,16 @@ except Exception:                     # pragma: no cover
 # 3. Logging
 # ----------------------------------------------------------------------
 def setup_logging(log_file: str = "crypto_attack.log", level: int = logging.INFO) -> logging.Logger:
+    """
+    Configure and return the module-level "CryptoAnalyzer" logger with a rotating file handler and a stream handler.
+    
+    Parameters:
+        log_file (str): Path to the log file used by the rotating file handler.
+        level (int): Logging level to apply to the logger (e.g., logging.INFO).
+    
+    Returns:
+        logging.Logger: The configured "CryptoAnalyzer" logger instance.
+    """
     logger = logging.getLogger("CryptoAnalyzer")
     logger.setLevel(level)
     logger.handlers.clear()
@@ -141,19 +164,52 @@ if ECDSA_AVAILABLE:
 # 5. Helper utilities
 # ----------------------------------------------------------------------
 def mod_inverse(a: int, m: int) -> int:
+    """
+    Compute the modular multiplicative inverse of `a` modulo `m`.
+    
+    Parameters:
+        a (int): Integer whose modular inverse is sought.
+        m (int): Modulus (must be a positive integer).
+    
+    Returns:
+        inverse (int): The integer `x` in the range [0, m-1] such that `(a * x) % m == 1`.
+    
+    Raises:
+        ValueError: If the inverse does not exist (i.e., `a` and `m` are not coprime).
+    """
     g, x, _ = extended_gcd(a, m)
     if g != 1:
         raise ValueError("inverse does not exist")
     return x % m
 
 def extended_gcd(a: int, b: int) -> Tuple[int, int, int]:
+    """
+    Compute the greatest common divisor of two integers and coefficients for Bézout's identity.
+    
+    Parameters:
+        a (int): First integer.
+        b (int): Second integer.
+    
+    Returns:
+        gcd (int): The greatest common divisor of `a` and `b`.
+        x (int): Coefficient satisfying `a*x + b*y == gcd`.
+        y (int): Coefficient satisfying `a*x + b*y == gcd`.
+    """
     if a == 0:
         return b, 0, 1
     g, x1, y1 = extended_gcd(b % a, a)
     return g, y1 - (b // a) * x1, x1
 
 def shannon_entropy(arr: np.ndarray) -> float:
-    """Shannon entropy in bits (object-dtype safe)."""
+    """
+    Compute the Shannon entropy of the values in a NumPy array, expressed in bits.
+    
+    Parameters:
+        arr (np.ndarray): Array of observations; can be any dtype. An empty array yields 0.0.
+    
+    Returns:
+        float: Entropy in bits of the empirical distribution of values in `arr`; `0.0` for empty input.
+    """
     if arr.size == 0:
         return 0.0
     if SCIPY_AVAILABLE:
@@ -166,6 +222,19 @@ def shannon_entropy(arr: np.ndarray) -> float:
 # 6. ECDSA helpers
 # ----------------------------------------------------------------------
 def decompress_public_key(pubkey_hex: str) -> Point:
+    """
+    Decompresses a compressed secp256k1 public key hex string into an elliptic-curve Point.
+    
+    Parameters:
+        pubkey_hex (str): Compressed public key as a hex string starting with prefix "02" or "03".
+    
+    Returns:
+        Point: The corresponding secp256k1 curve point.
+    
+    Raises:
+        RuntimeError: If the required fastecdsa backend is not available.
+        ValueError: If the prefix is not "02" or "03", or if the resulting point is not on the curve.
+    """
     if not ECDSA_AVAILABLE:
         raise RuntimeError("fastecdsa required")
     prefix = int(pubkey_hex[:2], 16)
@@ -182,6 +251,15 @@ def decompress_public_key(pubkey_hex: str) -> Point:
     return point
 
 def parse_der_signature(sig: bytes) -> Optional[Tuple[int, int]]:
+    """
+    Parse a DER-encoded ECDSA signature and return its (r, s) components if valid.
+    
+    Parameters:
+    	sig (bytes): DER-encoded signature bytes (commonly as found in transaction scriptSigs).
+    
+    Returns:
+    	Optional[Tuple[int, int]]: A tuple `(r, s)` containing the signature components when both are integers greater than 0 and less than the curve order; `None` if parsing fails or the values are out of range.
+    """
     if CRYPTO_AVAILABLE:
         try:
             r, s = asym_utils.decode_dss_signature(sig)
@@ -192,27 +270,40 @@ def parse_der_signature(sig: bytes) -> Optional[Tuple[int, int]]:
     if len(sig) < 8 or sig[0] != 0x30:
         return None
     i = 2
-    if sig[i] != 0x02:
-        return None
+    if sig[i] != 0x02: return None
     i += 1
-    r_len = sig[i]
+    r_len = sig[i]; i += 1
+    r = int.from_bytes(sig[i:i+r_len], "big"); i += r_len
+    if sig[i] != 0x02: return None
     i += 1
-    r = int.from_bytes(sig[i : i + r_len], "big")
-    i += r_len
-    if sig[i] != 0x02:
-        return None
-    i += 1
-    s_len = sig[i]
-    i += 1
-    s = int.from_bytes(sig[i : i + s_len], "big")
+    s_len = sig[i]; i += 1
+    s = int.from_bytes(sig[i:i+s_len], "big")
     if 0 < r < CURVE_N and 0 < s < CURVE_N:
         return r, s
     return None
 
 def validate_private_key(k: int) -> bool:
+    """
+    Determine whether an integer is a valid secp256k1 private key.
+    
+    Parameters:
+        k (int): Candidate private key to check.
+    
+    Returns:
+        True if `k` is between 1 and `CURVE_N - 1` (inclusive), False otherwise.
+    """
     return 0 < k < CURVE_N
 
 def private_key_to_public_key(k: int) -> Optional[Point]:
+    """
+    Derives the public elliptic-curve point corresponding to a given private scalar.
+    
+    Parameters:
+        k (int): Private key scalar; must be greater than 0 and less than CURVE_N.
+    
+    Returns:
+        Point or None: The public key point k·G on the secp256k1 curve, or `None` if the private key is invalid, the cryptographic backend is unavailable, or the point multiplication fails.
+    """
     if not ECDSA_AVAILABLE or not validate_private_key(k):
         return None
     try:
@@ -227,7 +318,18 @@ def private_key_to_public_key(k: int) -> Optional[Point]:
 def reduce_lattice_bkz(matrix: List[List[int]],
                        block_size: int = 40,
                        tours: int = 15) -> Optional[List[List[int]]]:
-    if not FPYLLL_AVAILABLE:
+    """
+                       Reduce an integer lattice matrix using LLL followed by BKZ reduction.
+                       
+                       Parameters:
+                           matrix (List[List[int]]): Integer matrix representing the lattice basis (rows are basis vectors).
+                           block_size (int): BKZ block size controlling the strength of blockwise reduction.
+                           tours (int): Maximum number of BKZ loops (iterations) to perform.
+                       
+                       Returns:
+                           Optional[List[List[int]]]: The reduced matrix as a list of integer rows on success; `None` if the fpylll backend is unavailable or reduction fails.
+                       """
+                       if not FPYLLL_AVAILABLE:
         logger.warning("fpylll missing – skipping reduction")
         return None
     try:
@@ -249,12 +351,23 @@ def reduce_lattice_bkz(matrix: List[List[int]],
 # ----------------------------------------------------------------------
 class AdvancedCandidateRanker:
     def __init__(self, enable: bool = True):
+        """
+        Initialize the ranker and optionally build/train the internal ML pipeline.
+        
+        Parameters:
+            enable (bool): If True and scikit-learn is available, construct and train the internal model; if False, keep the ranker uninitialized.
+        """
         self.model: Optional[Pipeline] = None
         self.trained = False
         if enable and SKLEARN_AVAILABLE:
             self._init_model()
 
     def _init_model(self):
+        """
+        Initialize the internal ML ranking pipeline and train it on synthetic data.
+        
+        Sets self.model to a preprocessing + classifier Pipeline (XGBoost when available, otherwise scikit-learn's GradientBoosting) and invokes synthetic training with 6000 samples to produce a ready-to-use ranker.
+        """
         logger.info("Initializing ML ranker...")
         clf = (xgb.XGBClassifier(
                 n_estimators=150, max_depth=7, learning_rate=0.05,
@@ -270,6 +383,14 @@ class AdvancedCandidateRanker:
         self._train_synthetic(6000)
 
     def _train_synthetic(self, n: int):
+        """
+        Generate synthetic training data, train the internal classifier with GridSearchCV, and mark the model as trained.
+        
+        Generates `n` synthetic feature vectors by creating random 6-element rows, producing 'good' and 'bad' variants, extracting features, splitting into train/test sets, tuning hyperparameters via 3-fold grid search, and replacing the instance model with the best estimator. Logs training accuracy and chosen parameters; if no valid features are produced, training is skipped and the model remains untrained.
+        
+        Parameters:
+            n (int): Number of synthetic samples to generate (total examples requested; actual training set size may be smaller after feature filtering).
+        """
         logger.info(f"Generating {n} synthetic samples...")
         X, y = [], []
         for _ in range(n // 2):
@@ -299,14 +420,46 @@ class AdvancedCandidateRanker:
         self.trained = True
 
     def _good(self, row: List[int]) -> List[int]:
+        """
+        Apply a small random multiplicative perturbation to each integer in a row, leaving zeros unchanged.
+        
+        Each nonzero element is multiplied by a random factor in the range [0.9, 1.099), converted to an integer (truncated), and then clamped to a minimum of 1.
+        
+        Parameters:
+            row (List[int]): Input list of integers.
+        
+        Returns:
+            List[int]: New list with perturbed (and clamped) integer values; zeros are preserved.
+        """
         return [max(1, int(v * (1 + (secrets.randbelow(200)-100)/1000))) if v else 0
                 for v in row]
 
     def _bad(self, row: List[int]) -> List[int]:
+        """
+        Generate a perturbed integer row by randomly amplifying each non-zero entry.
+        
+        Parameters:
+            row (List[int]): Input integer row whose non-zero elements will be perturbed.
+        
+        Returns:
+            List[int]: New list where each non-zero element of `row` is multiplied by a random factor between 2.00 and 4.99 and converted to an integer; zero elements are preserved as 0.
+        """
         return [int(v * (2 + secrets.randbelow(300)/100)) if v else 0
                 for v in row]
 
     def _features(self, row: List[int]) -> Optional[List[float]]:
+        """
+        Compute a fixed-length numeric feature vector describing a lattice row for ML ranking.
+        
+        Parameters:
+            row (List[int]): Integer vector representing a lattice row or candidate solution.
+        
+        Returns:
+            Optional[List[float]]: A list of 21 clipped features (s, mx, mn, mean, std, l1, l2, linf, entropy, small_count,
+            normalized_distance, skewness, kurtosis, angle_metric, key_entropy, normalized_length, smoothness, geometric_volume,
+            sparsity, near_zero_count, sign_changes) describing magnitudes, distribution, norms, entropy and structural properties;
+            or `None` if the input is empty or feature computation fails.
+        """
         if not row:
             return None
         try:
@@ -344,6 +497,15 @@ class AdvancedCandidateRanker:
             return None
 
     def rank(self, candidates: List['CandidateKey']) -> List[Tuple['CandidateKey', float]]:
+        """
+        Rank candidate private keys by combining the ML model's probability with each candidate's base confidence.
+        
+        Parameters:
+            candidates (List[CandidateKey]): CandidateKey objects to rank. Each candidate's metadata may include a "row" entry used to compute model features.
+        
+        Returns:
+            List[Tuple[CandidateKey, float]]: Tuples of candidate and score, sorted descending by score. The score is 0.7 * model_probability + 0.3 * candidate.confidence when the internal model is available and features can be computed; otherwise the candidate's original confidence is used. Candidates lacking computable features are included with their original confidence. The candidate objects' `score` attribute is updated when a model-derived score is assigned.
+        """
         if not candidates:
             return []
         if not self.trained or not self.model:
@@ -388,6 +550,12 @@ class SignatureData:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        """
+        Validate that the signature components `r` and `s` are within the valid range for the curve.
+        
+        Raises:
+            ValueError: If either `r` or `s` is not greater than 0 and less than CURVE_N.
+        """
         if not (0 < self.r < CURVE_N and 0 < self.s < CURVE_N):
             raise ValueError("invalid r/s")
 
@@ -400,6 +568,11 @@ class CandidateKey:
     score: float = 0.0
 
     def __post_init__(self):
+        """
+        Clamp the instance's `confidence` attribute to the inclusive range 0.0 to 1.0.
+        
+        This method mutates `self.confidence` so that values below 0.0 become 0.0 and values above 1.0 become 1.0.
+        """
         self.confidence = max(0.0, min(1.0, self.confidence))
 
 # ----------------------------------------------------------------------
@@ -407,6 +580,11 @@ class CandidateKey:
 # ----------------------------------------------------------------------
 class BlockchainClient:
     def __init__(self):
+        """
+        Initialize the BlockchainClient HTTP session with robust retry behavior and a custom User-Agent.
+        
+        Configures a requests.Session that retries transient HTTP errors (5 total attempts, exponential backoff via backoff_factor=1) for status codes 429, 500, 502, 503, and 504, and mounts the retry-enabled adapter for both HTTP and HTTPS. Also sets the session's User-Agent header to "CryptoAnalyzer/2.0".
+        """
         self.session = requests.Session()
         retry = Retry(total=5, backoff_factor=1,
                       status_forcelist=[429,500,502,503,504])
@@ -416,6 +594,15 @@ class BlockchainClient:
         self.session.headers.update({"User-Agent": "CryptoAnalyzer/2.0"})
 
     def get_address_txs(self, address: str) -> List[str]:
+        """
+        Fetch transaction IDs for a Bitcoin address from the Blockstream API.
+        
+        Parameters:
+            address (str): Bitcoin address to query.
+        
+        Returns:
+            txids (List[str]): List of transaction IDs (hex) associated with the address; empty list on error or if no transactions are found.
+        """
         url = f"https://blockstream.info/api/address/{address}/txs"
         try:
             data = self.session.get(url, timeout=20).json()
@@ -425,7 +612,15 @@ class BlockchainClient:
             return []
 
     def get_raw_tx(self, txid: str) -> Optional[bytes]:
-        url = f"{self.base_url}/tx/{txid}/hex"
+        """
+        Fetch the raw transaction hex for a given transaction ID from Blockstream and return it as raw bytes.
+        
+        Retrieves the transaction hex from the Blockstream API endpoint and decodes it.
+        
+        Returns:
+            bytes: Raw transaction bytes decoded from hex, or `None` if retrieval or decoding fails.
+        """
+        url = f"https://blockstream.info/api/tx/{txid}/hex"
         try:
             txt = self.session.get(url, timeout=15).text.strip()
             return bytes.fromhex(txt)
@@ -434,6 +629,15 @@ class BlockchainClient:
             return None
 
     def extract_signatures(self, raw_tx: bytes) -> List[bytes]:
+        """
+        Parse a raw serialized Bitcoin transaction and extract signature byte sequences from each input's scriptSig.
+        
+        Parameters:
+            raw_tx (bytes): Raw serialized Bitcoin transaction bytes.
+        
+        Returns:
+            List[bytes]: A list of signature byte sequences with the trailing sighash byte removed (e.g. DER signature bytes).
+        """
         sigs = []
         i = 4
         vin_cnt = raw_tx[i]; i += 1
@@ -464,7 +668,17 @@ class BlockchainClient:
 
     def signatures_for_address(self, address: str,
                                max_txs: int = 30) -> List[SignatureData]:
-        txids = self.get_address_txs(address)[:max_txs]
+        """
+                               Collects and parses ECDSA signatures found in recent transactions for a given address.
+                               
+                               Parameters:
+                                   address (str): Blockchain address to query for transactions.
+                                   max_txs (int): Maximum number of recent transactions to scan (default 30).
+                               
+                               Returns:
+                                   List[SignatureData]: A list of parsed signatures; each item contains `r`, `s`, the double-SHA256 of the raw transaction as `message`, and the originating `txid`.
+                               """
+                               txids = self.get_address_txs(address)[:max_txs]
         sigs: List[SignatureData] = []
         for txid in txids:
             raw = self.get_raw_tx(txid)
@@ -483,6 +697,24 @@ class BlockchainClient:
 # 11. NONCE BIAS + ENTROPY (NO OVERFLOW – pure Python int)
 # ----------------------------------------------------------------------
 def detect_nonce_bias(signatures: List[SignatureData]) -> Dict[str, Any]:
+    """
+    Analyze a list of ECDSA signatures for low/high 8-bit nonce (r) entropy and report basic statistics.
+    
+    Parameters:
+        signatures (List[SignatureData]): List of signature records whose `r` values will be analyzed.
+    
+    Returns:
+        Dict[str, Any]: A dictionary with the following keys:
+            - total_sigs (int): Number of signatures analyzed.
+            - entropy_low_8bits (float): Shannon entropy (bits) of the lowest 8 bits of the `r` values.
+            - entropy_high_8bits (float): Shannon entropy (bits) of the highest 8 bits of the `r` values.
+            - bias_detected (bool): `true` if either low- or high-8-bit entropy is less than 3.0, `false` otherwise.
+            - mean_r (float): Mean of the `r` values.
+            - std_r (float): Population standard deviation of the `r` values.
+    
+    Notes:
+        If fewer than 3 signatures are provided, the function returns `{"bias_detected": False, "total_sigs": <n>}` without computing entropies.
+    """
     if len(signatures) < 3:
         return {"bias_detected": False, "total_sigs": len(signatures)}
 
@@ -528,9 +760,23 @@ def detect_nonce_bias(signatures: List[SignatureData]) -> Dict[str, Any]:
 # ----------------------------------------------------------------------
 class AdvancedLatticeBuilder:
     def __init__(self):
+        """
+        Initialize the builder and create a BlockchainClient for blockchain I/O.
+        
+        Sets self.client to a new BlockchainClient instance used to fetch transactions and raw transaction data.
+        """
         self.client = BlockchainClient()
 
     def _basic(self, pub: Point) -> List[List[int]]:
+        """
+        Builds the basic integer lattice matrix for lattice-based private key recovery using the public key coordinates.
+        
+        Parameters:
+            pub (Point): Elliptic-curve public key point whose x and y coordinates are used (values will be reduced modulo CURVE_N).
+        
+        Returns:
+            List[List[int]]: A 3×4 integer matrix with CURVE_N on the diagonal and the public point coordinates (mod CURVE_N) in the last column.
+        """
         qx = pub.x % CURVE_N
         qy = pub.y % CURVE_N
         return [[CURVE_N,0,0,qx],
@@ -538,6 +784,16 @@ class AdvancedLatticeBuilder:
                 [0,0,CURVE_N,1]]
 
     def _hnp(self, pub: Point, sigs: List[SignatureData]) -> List[List[int]]:
+        """
+        Construct an HNP-style lattice matrix for the given public key, optionally extended with rows derived from signatures.
+        
+        Parameters:
+            pub (Point): Decompressed public key point used to build the base lattice.
+            sigs (List[SignatureData]): Signatures to incorporate; at most the first 1000 entries are used. When provided, each signature contributes three rows derived from the signature's r, s and message values. If empty, a large-scale diagonal block is appended instead.
+        
+        Returns:
+            List[List[int]]: Integer matrix represented as a list of rows suitable for lattice reduction.
+        """
         mat = self._basic(pub)
         if sigs:
             for s in sigs[:1000]:
@@ -556,6 +812,16 @@ class AdvancedLatticeBuilder:
         return mat
 
     def _extended(self, pub: Point, sigs: List[SignatureData]) -> List[List[int]]:
+        """
+        Builds an extended lattice for endomorphism-aware attacks by augmenting the HNP lattice with rows derived from the public key and fixed endomorphism constants.
+        
+        Parameters:
+            pub (Point): The elliptic-curve public key point whose coordinates are used to generate endomorphism-derived rows.
+            sigs (List[SignatureData]): Signature records used to construct the base HNP lattice; may be empty.
+        
+        Returns:
+            List[List[int]]: Integer matrix as a list of rows representing the extended lattice. If the endomorphism augmentation fails, the returned matrix is the unmodified HNP lattice.
+        """
         mat = self._hnp(pub, sigs)
         try:
             beta = 0x7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee
@@ -572,11 +838,32 @@ class AdvancedLatticeBuilder:
         return mat
 
     def _kannan(self, pub: Point, sigs: List[SignatureData]) -> List[List[int]]:
+        """
+        Builds a lattice matrix suitable for Kannan-style small-nonce key recovery attacks.
+        
+        Parameters:
+            pub (Point): The public key point used to construct lattice basis vectors.
+            sigs (List[SignatureData]): Collected signatures influencing additional lattice rows; may be empty.
+        
+        Returns:
+            List[List[int]]: Integer matrix represented as a list of rows, each row being a list of integers forming the lattice basis.
+        """
         return self._hnp(pub, sigs)
 
     def build(self, pub_hex: str, sigs: Optional[List[SignatureData]],
               algo: str = "extended") -> Optional[List[List[int]]]:
-        try:
+        """
+              Builds and reduces a lattice for the given public key and optional signatures using the selected algorithm.
+              
+              Parameters:
+                  pub_hex (str): Hex-encoded public key (compressed or uncompressed) to base the lattice on.
+                  sigs (Optional[List[SignatureData]]): Optional list of signature records that may be used to extend or parameterize the lattice.
+                  algo (str): Desired algorithm name hint (e.g., "extended", "hnp", "bkz"); the method will choose a reduction path based on the resolved algorithm string.
+              
+              Returns:
+                  Optional[List[List[int]]]: A reduced lattice matrix (list of integer rows) when reduction succeeds, or `None` if the public key is invalid or reduction cannot be performed.
+              """
+              try:
             pub = decompress_public_key(pub_hex)
         except Exception as e:
             logger.error(f"Bad pubkey: {e}")
@@ -858,6 +1145,15 @@ def decompress_public_key(public_key_hex: str) -> Point:
 
 
 def parse_der_signature(signature: bytes) -> Optional[Tuple[int, int]]:
+    """
+    Constructs a directed isogeny vulnerability graph that encodes risk attributes for several named elliptic curves.
+    
+    Parameters:
+    	signature (bytes): Ignored; present for API compatibility.
+    
+    Returns:
+    	networkx.DiGraph: A directed graph whose nodes are curve names with attributes `type` (str) and `risk` (float), and whose edges have attributes `weight` (float) and `vulnerability` (float).
+    """
     if not signature or len(signature) < 2:
         return None
     g = nx.DiGraph()
@@ -889,6 +1185,17 @@ def parse_der_signature(signature: bytes) -> Optional[Tuple[int, int]]:
     return g
 
 def analyze_isogeny(g: nx.DiGraph):
+    """
+    Analyze an isogeny vulnerability graph and print the highest-risk paths from "secp256k1" to "weak_curve_dual_ec".
+    
+    Scans all simple paths from the node "secp256k1" to "weak_curve_dual_ec" with a path length cutoff of 4, computes a risk score for each path as
+    edge_product * (1 + max_node_risk) where edge_product is the product of each edge's "vulnerability" attribute and max_node_risk is the maximum
+    "risk" attribute among nodes on the path, then prints a summary including the total paths examined, the highest-risk route and its score, and the
+    top 5 vulnerable paths with their risk scores.
+    
+    Parameters:
+        g (networkx.DiGraph): Directed graph whose nodes have a numeric "risk" attribute and whose edges have a numeric "vulnerability" attribute.
+    """
     print("\n" + "="*70)
     print("ADVANCED ISOGENY ATTACK ANALYSIS")
     print("="*70)
@@ -898,6 +1205,15 @@ def analyze_isogeny(g: nx.DiGraph):
         print("   No vulnerable path found.")
         return
     def path_risk(p):
+        """
+        Compute a combined risk score for a path by multiplying edge vulnerabilities and scaling by the highest node risk.
+        
+        Parameters:
+            p (Sequence): Sequence of node identifiers defining the path (ordered).
+        
+        Returns:
+            float: The path risk equal to the product of each edge's `vulnerability` attribute multiplied by (1 + maximum `risk` among nodes on the path).
+        """
         edge_r = 1.0
         node_r = 0.0
         for i in range(len(p)-1):
@@ -917,6 +1233,15 @@ def analyze_isogeny(g: nx.DiGraph):
 # 14. Endomorphism verification
 # ----------------------------------------------------------------------
 def verify_endomorphism(pub: Point) -> bool:
+    """
+    Checks whether a public key point satisfies the secp256k1 endomorphism relation (using the curve's lambda/beta constants).
+    
+    Parameters:
+        pub (Point): Elliptic-curve point representing the public key.
+    
+    Returns:
+        bool: `true` if the point satisfies the endomorphism relation x' * beta ≡ x (mod p), `false` otherwise (including when the input is invalid).
+    """
     try:
         beta = 0x7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee
         lam  = 0x5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72
@@ -930,13 +1255,33 @@ def verify_endomorphism(pub: Point) -> bool:
 # ----------------------------------------------------------------------
 class CryptoAttackOrchestrator:
     def __init__(self):
+        """
+        Initialize orchestrator components for lattice construction, candidate ranking, and blockchain access.
+        
+        Attributes:
+            lattice: AdvancedLatticeBuilder instance used to build lattices for attack variants.
+            ranker: AdvancedCandidateRanker instance used to score and order candidate keys.
+            client: BlockchainClient instance used to fetch transactions and extract signatures.
+        """
         self.lattice = AdvancedLatticeBuilder()
         self.ranker = AdvancedCandidateRanker(SKLEARN_AVAILABLE)
         self.client = BlockchainClient()
 
     def _extract_from_lattice(self, mat: List[List[int]],
                               pub_hex: str, src: str) -> List[CandidateKey]:
-        red = reduce_lattice_bkz(mat)
+        """
+                              Extract candidate private keys from a reduced lattice matrix for a given public key.
+                              
+                              Parameters:
+                                  mat (List[List[int]]): Integer lattice matrix to reduce and scan for candidate rows.
+                                  pub_hex (str): Hexadecimal public key associated with the lattice (used for context/metadata).
+                                  src (str): Origin label for produced candidates (e.g., algorithm name or data source).
+                              
+                              Returns:
+                                  List[CandidateKey]: CandidateKey objects built from valid private-key integers found in the reduced lattice.
+                                      Returns an empty list if lattice reduction fails or no valid candidates are found.
+                              """
+                              red = reduce_lattice_bkz(mat)
         if not red:
             return []
         cands = []
@@ -952,10 +1297,29 @@ class CryptoAttackOrchestrator:
         return cands
 
     def _validate(self, cand: CandidateKey, target: Point) -> bool:
+        """
+        Check whether a candidate private key corresponds to a target public point.
+        
+        Parameters:
+            cand (CandidateKey): Candidate containing the private key to verify.
+            target (Point): Expected public key point to compare against.
+        
+        Returns:
+            True if the candidate's derived public point equals `target`, False otherwise.
+        """
         pub = private_key_to_public_key(cand.key)
         return pub is not None and pub.x == target.x and pub.y == target.y
 
     def analyse(self, address: str, pub_hex: str) -> None:
+        """
+        Orchestrates end-to-end cryptanalytic analysis for a Bitcoin address and its public key.
+        
+        Performs: retrieval of recent signatures for `address`, nonce-bias detection, construction and reduction of lattices using multiple algorithms (basic, hnp, extended, kannan), an endomorphism property check on the provided public key, ML-based ranking of candidates, and parallel validation of top candidates against the target public key. Results and progress are logged; a brief summary and any recovered private keys are printed to stdout.
+        
+        Parameters:
+            address (str): Bitcoin address from which to fetch recent transactions/signatures.
+            pub_hex (str): Hex-encoded public key (compressed or uncompressed) corresponding to the target address.
+        """
         start = time.time()
 
         # 1. signatures + bias
@@ -1012,6 +1376,11 @@ class CryptoAttackOrchestrator:
 # 16. Main
 # ----------------------------------------------------------------------
 def main() -> None:
+    """
+    Run a demonstration analysis: orchestrate lattice/ML-based cryptanalysis for a sample Bitcoin address and compressed public key.
+    
+    This entry-point prints a header, constructs a CryptoAttackOrchestrator, runs a full analysis using the hard-coded BITCOIN_ADDRESS and PUBKEY_COMPRESSED values (placeholders intended to be edited), and — if NetworkX is available — builds and analyzes an isogeny graph. Side effects: console output and network access when fetching blockchain data.
+    """
     print("\n" + "="*70)
     print("ADVANCED BITCOIN CRYPTOGRAPHIC ANALYSIS TOOL v2.0")
     print("="*70)
