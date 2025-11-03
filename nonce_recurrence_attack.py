@@ -559,11 +559,11 @@ class ECDSANonceRecurrenceAttack:
             pubkey_point = private_key * g
             pubkey = ecdsa.ecdsa.Public_key(g, pubkey_point)
             for i, sig in enumerate(signatures):
-                if pubkey.verifies(h[i] % self.order, sig):
-                    return True
+                if not pubkey.verifies(h[i] % self.order, sig):
+                    return False
         except Exception:
             return False
-        return False
+        return True
 
 
 def main() -> None:
