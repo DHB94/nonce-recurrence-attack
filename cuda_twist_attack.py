@@ -324,19 +324,41 @@ class CurveBatchResult:
     partials: List[PartialResidue]
 
 
+def _is_quadratic_non_residue(value: int) -> bool:
+    """Return ``True`` if ``value`` is a quadratic non-residue modulo ``p``."""
+
+    legendre = pow(value % SECP256K1_PRIME, (SECP256K1_PRIME - 1) // 2, SECP256K1_PRIME)
+    return legendre == SECP256K1_PRIME - 1
+
+
 def generate_twist_curves() -> Dict[str, EllipticCurve]:
-    """Generate quadratic and random twists whose orders differ from secp256k1."""
+    """Generate quadratic twists and random curves with distinct orders."""
 
     curves: Dict[str, EllipticCurve] = {}
 
-    for k in range(1, TARGET_CURVES * 2):
-        twist_b = (7 + k * SECP256K1_PRIME) % SECP256K1_PRIME
-        curve = EllipticCurve(base_field, [0, twist_b])
-        if curve.order() != SECP256K1_ORDER:
-            curves[f"quad_{k}"] = curve
-        if len(curves) >= TARGET_CURVES // 2:
-            break
+    # ------------------------------------------------------------------
+    # Deterministically walk the integers until we collect a diverse set
+    # of quadratic twists.  We explicitly require the twisting parameter
+    # to be a quadratic non-residue so that ``quadratic_twist`` produces a
+    # genuinely distinct curve rather than the base curve itself.
+    # ------------------------------------------------------------------
+    twist_seed = 2
+    while len(curves) < TARGET_CURVES // 2 and twist_seed < TARGET_CURVES * 10:
+        if _is_quadratic_non_residue(twist_seed):
+            try:
+                twist = secp256k1.quadratic_twist(base_field(twist_seed))
+            except Exception:
+                twist_seed += 1
+                continue
 
+            if twist.order() != SECP256K1_ORDER:
+                curves[f"quad_{twist_seed}"] = twist
+        twist_seed += 1
+
+    # ------------------------------------------------------------------
+    # Supplement the twists with random curves.  These must admit the
+    # supplied public key and should not duplicate the base curve order.
+    # ------------------------------------------------------------------
     attempts = 0
     while len(curves) < TARGET_CURVES and attempts < MAX_CURVE_GEN_ATTEMPTS:
         attempts += 1
