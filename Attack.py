@@ -425,7 +425,7 @@ class BlockchainClient:
             return []
 
     def get_raw_tx(self, txid: str) -> Optional[bytes]:
-        url = f"https://blockstream.info/api/tx/{txid}/hex"
+        url = f"{self.base_url}/tx/{txid}/hex"
         try:
             txt = self.session.get(url, timeout=15).text.strip()
             return bytes.fromhex(txt)
