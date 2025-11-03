@@ -76,7 +76,9 @@ def find_attack_path(graph):
         path = nx.shortest_path(graph, source=start, target=target)
         print(f"⚡ Isogeny Attack Path Found: {path}")
     except ValueError:
-        print("[❌] Invalid nodes or no path exists.")
+        print("[❌] Invalid input. Please enter integers for start and target nodes.")
+    except nx.NodeNotFound:
+        print("[❌] One or both nodes do not exist in the graph.")
     except nx.NetworkXNoPath:
         print("[❌] No path exists between the selected nodes.")
 
