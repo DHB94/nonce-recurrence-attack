@@ -1,11 +1,9 @@
 import math
 import random
 from dataclasses import dataclass
-from typing import Generator, List, Optional, Sequence, Tuple
+from typing import Generator, Iterable, List, Optional, Sequence, Tuple
 
-import networkx as nx
 import requests
-from cryptography.hazmat.primitives.asymmetric import utils as asym_utils
 from fastecdsa.curve import secp256k1
 from fastecdsa.point import Point
 from fpylll import IntegerMatrix, LLL
@@ -20,18 +18,14 @@ def get_attack_mode():
     print("1: Endomorphism Weakness")
     print("2: Isogeny Graph Pathfinding")
     print("3: Lattice Reduction (Private Key Extraction)")
-
     while True:
         try:
             choice = int(input("Enter Choice (1/2/3): ").strip())
+            if choice in {1, 2, 3}:
+                return choice
+            print("[❌] Invalid choice. Please enter 1, 2, or 3.")
         except ValueError:
             print("[❌] Invalid input. Please enter 1, 2, or 3.")
-            continue
-
-        if choice in {1, 2, 3}:
-            return choice
-
-        print("[❌] Invalid choice. Please enter 1, 2, or 3.")
 
 
 def check_endomorphism():
@@ -49,36 +43,34 @@ def check_endomorphism():
 
 
 def create_isogeny_graph():
-    print("\n[🔹] Constructing Isogeny Graph...")
+    import networkx as nx
 
+    print("\n[🔹] Constructing Isogeny Graph...")
     while True:
         try:
             graph_size = int(input("Enter Graph Size (Recommended: 50+): ").strip())
+            if graph_size > 0:
+                graph = nx.Graph()
+                for i in range(1, graph_size):
+                    graph.add_edge(i, i + 2)
+                print("[✅] Isogeny Graph Created Successfully!")
+                return graph
+            else:
+                print("[❌] Graph size must be positive.")
         except ValueError:
             print("[❌] Invalid graph size. Please enter an integer.")
-            continue
-
-        if graph_size <= 0:
-            print("[❌] Graph size must be positive.")
-            continue
-
-        graph = nx.Graph()
-        for i in range(1, graph_size):
-            graph.add_edge(i, i + 2)
-        print("[✅] Isogeny Graph Created Successfully!")
-        return graph
 
 
 def find_attack_path(graph):
+    import networkx as nx
+
     try:
         start = int(input("Enter Start Node: ").strip())
         target = int(input("Enter Target Node: ").strip())
         path = nx.shortest_path(graph, source=start, target=target)
         print(f"⚡ Isogeny Attack Path Found: {path}")
     except ValueError:
-        print("[❌] Invalid input. Please enter integers for start and target nodes.")
-    except nx.NodeNotFound:
-        print("[❌] One or both nodes do not exist in the graph.")
+        print("[❌] Invalid nodes or no path exists.")
     except nx.NetworkXNoPath:
         print("[❌] No path exists between the selected nodes.")
 
@@ -270,19 +262,22 @@ def decompress_public_key(public_key_hex: str) -> Point:
 
 
 def parse_der_signature(signature: bytes) -> Optional[Tuple[int, int]]:
-    if not signature:
+    if not signature or signature[0] != 0x30:
         return None
-
-    # Bitcoin DER signatures typically end with a sighash flag byte. Strip it
-    # before handing the payload to a hardened ASN.1 decoder.
-    core_signature = signature[:-1] if len(signature) > 1 else signature
 
     try:
-        r, s = asym_utils.decode_dss_signature(core_signature)
-    except ValueError:
+        total_length = signature[1]
+        if total_length + 2 > len(signature):
+            return None
+        r_offset = 4
+        r_length = signature[3]
+        r = int.from_bytes(signature[r_offset : r_offset + r_length], "big")
+        s_offset = r_offset + r_length + 2
+        s_length = signature[s_offset - 1]
+        s = int.from_bytes(signature[s_offset : s_offset + s_length], "big")
+        return r, s
+    except (IndexError, ValueError):
         return None
-
-    return r, s
 
 
 def construct_optimal_lattice_matrix(public_key_hex: str):
@@ -361,26 +356,23 @@ def extract_candidate_private_keys(lattice_matrix: IntegerMatrix) -> List[Candid
     return candidates
 
 
+def _normalize(values: Iterable[float]) -> List[float]:
+    data = list(values)
+    if not data:
+        return []
+    mean = sum(data) / len(data)
+    variance = sum((item - mean) ** 2 for item in data) / max(len(data) - 1, 1)
+    std = math.sqrt(variance) or 1.0
+    return [(item - mean) / std for item in data]
+
+
 class LogisticRankingModel:
     """Tiny logistic regression trained on synthetic lattice statistics."""
 
-    _trained_parameters: Optional[Tuple[List[float], float, List[float], List[float]]] = None
-
     def __init__(self) -> None:
-        if LogisticRankingModel._trained_parameters is None:
-            LogisticRankingModel._trained_parameters = self._train()
-
-        (
-            trained_weights,
-            trained_bias,
-            trained_mean,
-            trained_std,
-        ) = LogisticRankingModel._trained_parameters
-
-        self.weights = list(trained_weights)
-        self.bias = float(trained_bias)
-        self.feature_mean = list(trained_mean)
-        self.feature_std = list(trained_std)
+        self.weights: List[float] = []
+        self.bias: float = 0.0
+        self._train()
 
     def _generate_feature_vector(self, row: Sequence[int], candidate: int) -> List[float]:
         row_abs = [abs(value) for value in row]
@@ -397,14 +389,12 @@ class LogisticRankingModel:
             math.log1p(distance_from_half),
         ]
 
-    def _synthetic_dataset(
-        self, rng: random.Random, size: int = 256
-    ) -> Tuple[List[List[float]], List[int]]:
+    def _synthetic_dataset(self, size: int = 256) -> Tuple[List[List[float]], List[int]]:
         features: List[List[float]] = []
         labels: List[int] = []
         for _ in range(size):
-            row = [rng.randint(-10_000, 10_000) for _ in range(4)]
-            candidate = abs(rng.randint(1, n - 1))
+            row = [random.randint(-10_000, 10_000) for _ in range(4)]
+            candidate = abs(random.randint(1, n - 1))
             feature = self._generate_feature_vector(row, candidate)
             plausibility = 1 if min(abs(value) for value in row) < 500 else 0
             if abs(candidate - (n // 2)) < n // 10:
@@ -413,65 +403,40 @@ class LogisticRankingModel:
             labels.append(plausibility)
         return features, labels
 
-    def _train(self) -> Tuple[List[float], float, List[float], List[float]]:
-        rng = random.Random(1337)
-        features, labels = self._synthetic_dataset(rng)
+    def _train(self) -> None:
+        features, labels = self._synthetic_dataset()
         if not features:
-            return [], 0.0, [], []
+            return
 
-        num_features = len(features[0])
-        feature_mean = [0.0] * num_features
-        feature_std = [1.0] * num_features
-
-        for idx in range(num_features):
-            column = [row[idx] for row in features]
-            mean = sum(column) / len(column)
-            variance = sum((value - mean) ** 2 for value in column) / max(
-                len(column) - 1, 1
-            )
-            std = math.sqrt(variance) or 1.0
-            feature_mean[idx] = mean
-            feature_std[idx] = std
-
-        normalized = [
-            [
-                (row[idx] - feature_mean[idx]) / feature_std[idx]
-                for idx in range(num_features)
-            ]
-            for row in features
-        ]
-
+        transposed = list(zip(*features))
+        normalized_columns = [_normalize(column) for column in transposed]
+        normalized = list(zip(*normalized_columns))
         learning_rate = 0.05
-        weights = [0.0 for _ in range(num_features)]
-        bias = 0.0
+        self.weights = [0.0 for _ in range(len(normalized[0]))]
+        self.bias = 0.0
 
         for _ in range(200):
-            gradient_w = [0.0 for _ in weights]
+            gradient_w = [0.0 for _ in self.weights]
             gradient_b = 0.0
             for feats, label in zip(normalized, labels):
-                z = sum(w * f for w, f in zip(weights, feats)) + bias
+                z = sum(w * f for w, f in zip(self.weights, feats)) + self.bias
                 prediction = 1.0 / (1.0 + math.exp(-z))
                 error = prediction - label
                 for idx, value in enumerate(feats):
                     gradient_w[idx] += error * value
                 gradient_b += error
 
-            weights = [
+            self.weights = [
                 w - learning_rate * gw / len(normalized)
-                for w, gw in zip(weights, gradient_w)
+                for w, gw in zip(self.weights, gradient_w)
             ]
-            bias -= learning_rate * gradient_b / len(normalized)
-
-        return weights, bias, feature_mean, feature_std
+            self.bias -= learning_rate * gradient_b / len(normalized)
 
     def score(self, row: Sequence[int], candidate: int) -> float:
         feature = self._generate_feature_vector(row, candidate)
-        if not self.weights:
+        normalized = _normalize(feature)
+        if not self.weights or not normalized:
             return 0.0
-        normalized = [
-            (value - mean) / std if std else 0.0
-            for value, mean, std in zip(feature, self.feature_mean, self.feature_std)
-        ]
         z = sum(w * f for w, f in zip(self.weights, normalized)) + self.bias
         return 1.0 / (1.0 + math.exp(-z))
 
