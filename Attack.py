@@ -90,7 +90,7 @@ except Exception:  # pragma: no cover - optional dependency
     ECDSA_AVAILABLE = False
 
 try:
-    from fpylll import LLL, IntegerMatrix
+    from fpylll import BKZ, LLL, IntegerMatrix
 
     FPYLLL_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
@@ -808,7 +808,12 @@ class AdvancedReductionEngine:
             logger.error("Failed to create integer matrix: %s", exc)
             return None
 
-        logger.info("Starting lattice reduction with %s", self.algorithm)
+        algorithm_name = (self.algorithm or "lll").lower()
+        logger.info("Starting lattice reduction with %s", algorithm_name)
+
+        if "bkz" in algorithm_name:
+            return self._run_bkz(lattice_matrix, algorithm_name)
+
         return self._run_lll(lattice_matrix)
 
     def _run_lll(self, matrix: IntegerMatrix) -> IntegerMatrix:
@@ -820,6 +825,47 @@ class AdvancedReductionEngine:
                 self.callback("completed", 100.0, 0.0)
         except Exception as exc:
             logger.error("LLL reduction failed: %s", exc)
+        return matrix
+
+    def _run_bkz(self, matrix: IntegerMatrix, algorithm_name: str) -> IntegerMatrix:
+        dimension = matrix.ncols
+        if dimension <= 1:
+            logger.warning("Lattice dimension (%d) too small for BKZ; skipping", dimension)
+            return matrix
+
+        max_block = max(2, min(BKZ_BLOCK_SIZE, dimension))
+
+        def _apply_block(block_size: int) -> None:
+            effective_block = max(2, min(block_size, dimension))
+            logger.info("Running BKZ with block size %d", effective_block)
+            BKZ.reduction(matrix, BKZ.Param(block_size=effective_block, max_loops=BKZ_TOURS))
+
+        try:
+            if "progressive" in algorithm_name:
+                schedule: List[int] = []
+                step = 5
+                while step < max_block:
+                    if step >= 2:
+                        schedule.append(step)
+                    step += 5
+                if not schedule or schedule[-1] != max_block:
+                    schedule.append(max_block)
+
+                total_steps = len(schedule)
+                for index, block in enumerate(schedule, start=1):
+                    _apply_block(block)
+                    if self.callback:
+                        progress = min(100.0, 100.0 * index / total_steps)
+                        self.callback("bkz", progress, float(min(block, dimension)))
+            else:
+                _apply_block(max_block)
+                if self.callback:
+                    self.callback("bkz", 100.0, float(max_block))
+        except Exception as exc:
+            logger.error("BKZ reduction failed: %s", exc)
+            logger.info("Falling back to LLL reduction")
+            return self._run_lll(matrix)
+
         return matrix
 
 
