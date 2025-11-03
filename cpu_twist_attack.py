@@ -1,37 +1,23 @@
 #!/usr/bin/env python3
-"""CUDA assisted twist attack helper.
+"""CPU optimised twist attack helper.
 
-This module is a standalone runner that explores quadratic twists of the
-secp256k1 curve while attempting to recover discrete logarithm residues for the
-provided public key.  The implementation is intentionally defensive – it keeps
-the fancy terminal output from the original proof-of-concept but restructures
-the mathematical pipeline so that it can be profiled and extended.
+This script is a CPU-focused edition of the CUDA aware twist attack driver.  It
+keeps the same mathematical pipeline but removes the GPU specific plumbing so
+that multi-core hosts can be saturated efficiently.  Curve processing happens in
+parallel using ``ProcessPoolExecutor`` which allows the expensive Sage
+operations (Tonelli–Shanks, order factorisation and discrete logarithms) to run
+across all available cores.
 
-Key improvements compared to earlier iterations:
+Key differences compared to ``cuda_twist_attack.py``:
 
-* GPU acceleration is now explicitly guarded behind capability checks.  The
-  Tonelli–Shanks routine only executes on the GPU when the modulus can be
-  represented with 64-bit limbs.  For secp256k1 the modulus is 256 bits, so the
-  code automatically falls back to a constant‑time CPU implementation instead of
-  silently overflowing CuPy integer types.
-* The "top vector" selection keeps both square roots (``y`` and ``-y``) for each
-  twist, ensuring we do not miss residue classes that appear only on the negated
-  point.
-* When factoring twist orders we keep the largest subgroup moduli first so that
-  the CRT coverage increases monotonically with every additional congruence.
-* Periodic progress snapshots (``twist_attack_progress.json``) now include the
-  exact residues that contributed to the coverage so the run can be resumed or
-  post-processed later on.
-* An additional endomorphism-based attack path extracts residues from the
-  secp256k1 efficiently-computable automorphism, providing more independent
-  congruences for the CRT solver.
-* Final results include a verification report that re-checks every residue and
-  confirms the reconstructed private key against the target public key.
+* The Tonelli–Shanks routine is always executed on the CPU and is exposed as a
+  batch helper that works well with Python's process pools.
+* Curve batches are processed in parallel processes to overlap discrete log
+  computation and factorisation work.
+* Progress reporting is adapted for asynchronous processing and remains
+  deterministic regardless of worker scheduling.
 
-The script may be executed directly.  It depends on SageMath for elliptic curve
-operations and optionally on CuPy for GPU acceleration.  When CuPy is not
-available, or when the modulus is wider than 64 bits, execution automatically
-falls back to the CPU path.
+The script requires SageMath but has no optional dependencies such as CuPy.
 """
 
 from __future__ import annotations
@@ -43,6 +29,7 @@ import subprocess
 import sys
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from multiprocessing import cpu_count
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -51,19 +38,10 @@ import numpy as np
 import psutil
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import Progress
 from rich.text import Text
 
 warnings.filterwarnings("ignore")
-
-# ---------------------------------------------------------------------------
-# Optional CUDA imports – guarded so that we gracefully fall back to CPU.
-# ---------------------------------------------------------------------------
-try:  # pragma: no cover - optional dependency
-    import cupy as cp
-
-    CUDA_AVAILABLE = True
-except Exception:  # pragma: no cover - optional dependency
-    CUDA_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # SageMath imports
@@ -126,11 +104,14 @@ def _cube_root_of_unity(modulus: int) -> int:
     raise RuntimeError("Unable to locate a cube root of unity")
 
 
-def _compute_endomorphism_constants() -> Tuple[int, int]:
+def _compute_endomorphism_constants() -> Tuple[Optional[int], Optional[int]]:
     """Return the (beta, lambda) constants for the secp256k1 GLV map."""
 
-    beta = _cube_root_of_unity(SECP256K1_PRIME)
-    lam = _cube_root_of_unity(int(SECP256K1_ORDER))
+    try:
+        beta = _cube_root_of_unity(SECP256K1_PRIME)
+        lam = _cube_root_of_unity(int(SECP256K1_ORDER))
+    except Exception:
+        return None, None
     return beta, lam
 
 
@@ -145,12 +126,7 @@ def _apply_endomorphism(point) -> "EllipticCurvePoint":
     return point.curve()((new_x, int(y)))
 
 
-try:
-    ENDOMORPHISM_CONSTANTS = _compute_endomorphism_constants()
-except Exception:
-    ENDOMORPHISM_CONSTANTS = (None, None)
-
-_ENDOMORPHISM_BETA, _ENDOMORPHISM_LAMBDA = ENDOMORPHISM_CONSTANTS
+_ENDOMORPHISM_BETA, _ENDOMORPHISM_LAMBDA = _compute_endomorphism_constants()
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +195,7 @@ def show_glitch_logo() -> None:
         panel = Panel.fit(
             logo,
             title="[blink]BUDBOT333 CRYPTO ENGINE[/]",
-            subtitle="[bright_black]v3.4.0 | GPU-AWARE[/]",
+            subtitle="[bright_black]v3.4.0 | CPU EDITION[/]",
             border_style=random.choice(["red", "blue", "green"]),
             padding=(1, 3),
         )
@@ -228,7 +204,7 @@ def show_glitch_logo() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CUDA aware Tonelli–Shanks
+# CPU Tonelli–Shanks helpers
 # ---------------------------------------------------------------------------
 def tonelli_shanks_cpu(n: int, p: int) -> Optional[int]:
     """Tonelli–Shanks square root modulo ``p`` implemented on the CPU."""
@@ -273,37 +249,10 @@ def tonelli_shanks_cpu(n: int, p: int) -> Optional[int]:
     return r
 
 
-def _gpu_capable(p: int) -> bool:
-    """Return ``True`` when CUDA acceleration can safely be used."""
+def tonelli_shanks_batch(rhs_values: Sequence[int], p: int) -> List[Optional[int]]:
+    """Compute modular square roots for ``rhs_values`` on the CPU."""
 
-    if not CUDA_AVAILABLE:
-        return False
-    # CuPy currently exposes integer kernels up to 64 bits.  Guard anything
-    # larger to avoid silent overflow when dealing with secp256k1 sized primes.
-    return p.bit_length() <= 62
-
-
-def cuda_tonelli_shanks(rhs_values: Sequence[int], p: int) -> List[Optional[int]]:
-    """Compute modular square roots for ``rhs_values`` with optional CUDA.
-
-    When CUDA is unavailable or the modulus is wider than 64 bits the function
-    transparently falls back to the CPU implementation.
-    """
-
-    if not rhs_values:
-        return []
-
-    if not _gpu_capable(p):
-        return [tonelli_shanks_cpu(int(n % p), p) for n in rhs_values]
-
-    # The modulus fits in 64 bits which means we can safely use CuPy arrays.
-    rhs_arr = cp.asarray(rhs_values, dtype=cp.uint64)  # type: ignore[name-defined]
-
-    results = []
-    for value in rhs_arr.tolist():  # type: ignore[attr-defined]
-        root = tonelli_shanks_cpu(int(value % p), p)
-        results.append(root)
-    return results
+    return [tonelli_shanks_cpu(int(value % p), p) for value in rhs_values]
 
 
 # ---------------------------------------------------------------------------
@@ -331,17 +280,15 @@ def _is_quadratic_non_residue(value: int) -> bool:
     return legendre == SECP256K1_PRIME - 1
 
 
-def generate_twist_curves() -> Dict[str, EllipticCurve]:
-    """Generate quadratic twists and random curves with distinct orders."""
+def generate_twist_curves() -> Dict[str, Tuple[int, int]]:
+    """Generate quadratic twists and random curves with distinct orders.
 
-    curves: Dict[str, EllipticCurve] = {}
+    The return type stores integer ``(a4, a6)`` coefficients for later
+    reconstruction inside worker processes.
+    """
 
-    # ------------------------------------------------------------------
-    # Deterministically walk the integers until we collect a diverse set
-    # of quadratic twists.  We explicitly require the twisting parameter
-    # to be a quadratic non-residue so that ``quadratic_twist`` produces a
-    # genuinely distinct curve rather than the base curve itself.
-    # ------------------------------------------------------------------
+    curves: Dict[str, Tuple[int, int]] = {}
+
     twist_seed = 2
     while len(curves) < TARGET_CURVES // 2 and twist_seed < TARGET_CURVES * 10:
         if _is_quadratic_non_residue(twist_seed):
@@ -352,13 +299,10 @@ def generate_twist_curves() -> Dict[str, EllipticCurve]:
                 continue
 
             if twist.order() != SECP256K1_ORDER:
-                curves[f"quad_{twist_seed}"] = twist
+                a4, a6 = int(twist.a4()), int(twist.a6())
+                curves[f"quad_{twist_seed}"] = (a4, a6)
         twist_seed += 1
 
-    # ------------------------------------------------------------------
-    # Supplement the twists with random curves.  These must admit the
-    # supplied public key and should not duplicate the base curve order.
-    # ------------------------------------------------------------------
     attempts = 0
     while len(curves) < TARGET_CURVES and attempts < MAX_CURVE_GEN_ATTEMPTS:
         attempts += 1
@@ -370,20 +314,18 @@ def generate_twist_curves() -> Dict[str, EllipticCurve]:
         if curve.order() == SECP256K1_ORDER:
             continue
         try:
-            # Sanity check: ensure the public key lies on the curve before we use it.
             curve((PUBX, PUBY))
         except Exception:
             continue
-        curves[f"rand_{a_rand}_{b_rand}"] = curve
+        curves[f"rand_{a_rand}_{b_rand}"] = (int(curve.a4()), int(curve.a6()))
 
     return curves
 
 
-def _rhs_for_curve(curve: EllipticCurve, x: ZZ) -> int:
+def _rhs_for_curve(a4: int, a6: int, x: ZZ) -> int:
     """Return ``x`` mapped through the curve equation modulo the base field."""
 
-    a, b = curve.a4(), curve.a6()
-    rhs = (int(x) ** 3 + int(a) * int(x) + int(b)) % SECP256K1_PRIME
+    rhs = (int(x) ** 3 + int(a4) * int(x) + int(a6)) % SECP256K1_PRIME
     return rhs
 
 
@@ -407,8 +349,6 @@ def _unique_partials(partials: Iterable[PartialResidue]) -> List[PartialResidue]
             best[modulus] = partial
             continue
 
-        # Prefer verified residues, then those originating from the twist, then
-        # the one with the smallest absolute residue.
         if partial.verified and not candidate.verified:
             best[modulus] = partial
             continue
@@ -423,97 +363,97 @@ def _unique_partials(partials: Iterable[PartialResidue]) -> List[PartialResidue]
     return ordered[:TOP_VECTOR_LIMIT]
 
 
-def process_curve_batch(
-    curve_batch: Sequence[Tuple[str, EllipticCurve]]
-) -> List[CurveBatchResult]:
-    """Process a batch of twist curves and return residue information."""
+def _process_curve_worker(task: Tuple[str, int, int]) -> Optional[CurveBatchResult]:
+    """Worker entry point executed inside a process pool."""
 
-    rhs_values = [_rhs_for_curve(curve, PUBX) for _, curve in curve_batch]
-    roots = cuda_tonelli_shanks(rhs_values, SECP256K1_PRIME)
+    name, a4, a6 = task
+    curve = EllipticCurve(base_field, [a4, a6])
+    rhs = _rhs_for_curve(a4, a6, PUBX)
+    root = tonelli_shanks_batch([rhs], SECP256K1_PRIME)[0]
+    if root is None:
+        return None
 
-    batch_results: List[CurveBatchResult] = []
-    for (name, curve), root in zip(curve_batch, roots):
-        if root is None:
-            continue
+    order = int(curve.order())
+    if order < MIN_PRIME_SIZE:
+        return None
 
-        order = int(curve.order())
-        if order < MIN_PRIME_SIZE:
-            continue
+    try:
+        factors = (
+            ecm.factor(order) if order > 10**20 else factor(order)  # type: ignore[attr-defined]
+        )
+    except Exception:
+        return None
 
+    subgroup_candidates = [
+        (int(p), int(e))
+        for p, e in factors
+        if MIN_PRIME_SIZE <= int(p) < THRESHOLD
+    ]
+    if not subgroup_candidates:
+        return None
+
+    generator = curve.gens()[0]
+    partials: List[PartialResidue] = []
+
+    for candidate_root in {root % SECP256K1_PRIME, (-root) % SECP256K1_PRIME}:
         try:
-            factors = (
-                ecm.factor(order) if order > 10**20 else factor(order)  # type: ignore[attr-defined]
-            )
+            point = curve((int(PUBX), int(candidate_root)))
         except Exception:
             continue
 
-        # Focus on subgroups with primes large enough to contribute meaningful bits.
-        subgroup_candidates = [
-            (int(p), int(e))
-            for p, e in factors
-            if MIN_PRIME_SIZE <= int(p) < THRESHOLD
-        ]
-        if not subgroup_candidates:
-            continue
-
-        generator = curve.gens()[0]
-        partials: List[PartialResidue] = []
-
-        for candidate_root in {root % SECP256K1_PRIME, (-root) % SECP256K1_PRIME}:
+        for prime_factor, _ in subgroup_candidates:
+            h = order // prime_factor
+            h_point = h * point
+            h_gen = h * generator
+            if h_point.is_zero() or h_gen.is_zero():
+                continue
             try:
-                point = curve((int(PUBX), int(candidate_root)))
+                residue = int(discrete_log(h_point, h_gen, ord=prime_factor))
+                verified = _verify_discrete_log(h_gen, h_point, prime_factor, residue)
+                partials.append(
+                    PartialResidue(
+                        residue=residue % prime_factor,
+                        modulus=prime_factor,
+                        source="twist",
+                        verified=verified,
+                    )
+                )
+
+                if (
+                    _ENDOMORPHISM_BETA is not None
+                    and _ENDOMORPHISM_LAMBDA is not None
+                ):
+                    try:
+                        phi_point = _apply_endomorphism(h_point)
+                        phi_gen = _apply_endomorphism(h_gen)
+                        phi_residue = int(
+                            discrete_log(phi_point, phi_gen, ord=prime_factor)
+                        )
+                        expected = (_ENDOMORPHISM_LAMBDA * residue) % prime_factor
+                        phi_verified = _verify_discrete_log(
+                            phi_gen, phi_point, prime_factor, phi_residue
+                        ) and phi_residue % prime_factor == expected
+                        partials.append(
+                            PartialResidue(
+                                residue=phi_residue % prime_factor,
+                                modulus=prime_factor,
+                                source="endomorphism",
+                                verified=phi_verified,
+                            )
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 continue
 
-            for prime_factor, _ in subgroup_candidates:
-                h = order // prime_factor
-                h_point = h * point
-                h_gen = h * generator
-                if h_point.is_zero() or h_gen.is_zero():
-                    continue
-                try:
-                    residue = int(discrete_log(h_point, h_gen, ord=prime_factor))
-                    verified = _verify_discrete_log(h_gen, h_point, prime_factor, residue)
-                    partials.append(
-                        PartialResidue(
-                            residue=residue % prime_factor,
-                            modulus=prime_factor,
-                            source="twist",
-                            verified=verified,
-                        )
-                    )
+    if not partials:
+        return None
 
-                    # Extra attack: leverage the efficiently-computable
-                    # endomorphism to obtain an additional residue.
-                    if _ENDOMORPHISM_BETA is not None and _ENDOMORPHISM_LAMBDA is not None:
-                        try:
-                            phi_point = _apply_endomorphism(h_point)
-                            phi_gen = _apply_endomorphism(h_gen)
-                            phi_residue = int(
-                                discrete_log(phi_point, phi_gen, ord=prime_factor)
-                            )
-                            expected = (_ENDOMORPHISM_LAMBDA * residue) % prime_factor
-                            phi_verified = _verify_discrete_log(
-                                phi_gen, phi_point, prime_factor, phi_residue
-                            ) and phi_residue % prime_factor == expected
-                            partials.append(
-                                PartialResidue(
-                                    residue=phi_residue % prime_factor,
-                                    modulus=prime_factor,
-                                    source="endomorphism",
-                                    verified=phi_verified,
-                                )
-                            )
-                        except Exception:
-                            pass
-                except Exception:
-                    continue
+    unique = _unique_partials(partials)
+    if not unique:
+        return None
 
-        if partials:
-            unique = _unique_partials(partials)
-            batch_results.append(CurveBatchResult(name=name, order=order, partials=unique))
-
-    return batch_results
+    return CurveBatchResult(name=name, order=order, partials=unique)
 
 
 def compute_coverage(results: Sequence[CurveBatchResult]) -> float:
@@ -662,10 +602,7 @@ def save_progress(
 def main() -> None:
     try:
         process = psutil.Process()
-        if CUDA_AVAILABLE:
-            process.cpu_affinity([0, 1])
-        else:
-            process.cpu_affinity(list(range(cpu_count())))
+        process.cpu_affinity(list(range(cpu_count())))
     except Exception:
         pass
 
@@ -674,9 +611,7 @@ def main() -> None:
         f"\nStarting attack on public key ({PUBX:X}, {PUBY:X})...",
         style="bold bright_white",
     )
-    console.print(
-        f"CUDA Acceleration: {'Enabled' if _gpu_capable(SECP256K1_PRIME) else 'Disabled'}"
-    )
+    console.print("CUDA Acceleration: Disabled (CPU edition)")
     console.print(f"Sound Effects: {'Enabled' if SOUND_ENABLED else 'Disabled'}")
 
     start_time = time.time()
@@ -686,26 +621,37 @@ def main() -> None:
     curves = generate_twist_curves()
     console.print(f"Generated {len(curves)} twist curves")
 
-    batch_size = 1024 if _gpu_capable(SECP256K1_PRIME) else 32
-    items = list(curves.items())
+    tasks = list(curves.items())
+    last_save = start_time
 
-    for index in range(0, len(items), batch_size):
-        batch = items[index : index + batch_size]
-        batch_results = process_curve_batch(batch)
-        all_results.extend(batch_results)
+    with Progress(transient=True) as progress:
+        task_id = progress.add_task("Processing curves", total=len(tasks))
 
-        elapsed = time.time() - start_time
-        coverage_bits = compute_coverage(all_results)
-        coverage_history.append((elapsed, coverage_bits))
+        with ProcessPoolExecutor(max_workers=cpu_count()) as executor:
+            future_to_name = {
+                executor.submit(_process_curve_worker, (name, a4, a6)): name
+                for name, (a4, a6) in tasks
+            }
 
-        console.print(
-            f"Processed {min(index + batch_size, len(items))}/{len(items)} curves | "
-            f"Coverage: {coverage_bits:.1f} bits | "
-            f"Elapsed: {elapsed/60:.1f}m"
-        )
+            for future in as_completed(future_to_name):
+                progress.advance(task_id, 1)
+                name = future_to_name[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    console.print(f"[red]Worker failure on {name}: {exc}")
+                    continue
 
-        if elapsed > SAVE_INTERVAL:
-            save_progress(all_results, coverage_history)
+                if result is not None:
+                    all_results.append(result)
+
+                elapsed = time.time() - start_time
+                coverage_bits = compute_coverage(all_results)
+                coverage_history.append((elapsed, coverage_bits))
+
+                if time.time() - last_save > SAVE_INTERVAL:
+                    save_progress(all_results, coverage_history)
+                    last_save = time.time()
 
     summary = analyze_results(all_results)
     verification_report = verify_full_results(all_results, summary)
