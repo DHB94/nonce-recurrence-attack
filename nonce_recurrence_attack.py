@@ -599,10 +599,9 @@ def main() -> None:
         help="Max permutations to try (default: all permutations)",
     )
     parser.add_argument(
-        "--verbose",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable verbose output",
+        help="Enable verbose output (on by default)",
     )
     args = parser.parse_args()
 
