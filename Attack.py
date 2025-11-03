@@ -75,7 +75,7 @@ except Exception:                     # pragma: no cover
 
 try:
     from fpylll import BKZ, LLL, IntegerMatrix
-    from fpylll.algorithms.bkz2 import BKZReduction
+
     FPYLLL_AVAILABLE = True
 except Exception:                     # pragma: no cover
     FPYLLL_AVAILABLE = False
@@ -576,16 +576,284 @@ class AdvancedLatticeBuilder:
         except Exception as e:
             logger.error(f"Bad pubkey: {e}")
             return None
-        if algo == "basic":   return self._basic(pub)
-        if algo == "hnp":     return self._hnp(pub, sigs or [])
-        if algo == "kannan":  return self._kannan(pub, sigs or [])
-        return self._extended(pub, sigs or [])
 
-# ----------------------------------------------------------------------
-# 13. Isogeny graph + analysis
-# ----------------------------------------------------------------------
-def create_isogeny_graph() -> Optional[nx.DiGraph]:
-    if not NETWORKX_AVAILABLE:
+        algorithm_name = (self.algorithm or "lll").lower()
+        logger.info("Starting lattice reduction with %s", algorithm_name)
+
+        if "bkz" in algorithm_name:
+            return self._run_bkz(lattice_matrix, algorithm_name)
+
+        return self._run_lll(lattice_matrix)
+
+    def _run_lll(self, matrix: IntegerMatrix) -> IntegerMatrix:
+        try:
+            logger.info("Starting LLL reduction")
+            LLL.reduction(matrix)
+            logger.info("LLL reduction completed successfully")
+            if self.callback:
+                self.callback("completed", 100.0, 0.0)
+        except Exception as exc:
+            logger.error("LLL reduction failed: %s", exc)
+        return matrix
+
+    def _run_bkz(self, matrix: IntegerMatrix, algorithm_name: str) -> IntegerMatrix:
+        dimension = matrix.ncols
+        if dimension <= 1:
+            logger.warning("Lattice dimension (%d) too small for BKZ; skipping", dimension)
+            return matrix
+
+        max_block = max(2, min(BKZ_BLOCK_SIZE, dimension))
+
+        def _apply_block(block_size: int) -> None:
+            effective_block = max(2, min(block_size, dimension))
+            logger.info("Running BKZ with block size %d", effective_block)
+            BKZ.reduction(matrix, BKZ.Param(block_size=effective_block, max_loops=BKZ_TOURS))
+
+        try:
+            if "progressive" in algorithm_name:
+                schedule: List[int] = []
+                step = 5
+                while step < max_block:
+                    if step >= 2:
+                        schedule.append(step)
+                    step += 5
+                if not schedule or schedule[-1] != max_block:
+                    schedule.append(max_block)
+
+                total_steps = len(schedule)
+                for index, block in enumerate(schedule, start=1):
+                    _apply_block(block)
+                    if self.callback:
+                        progress = min(100.0, 100.0 * index / total_steps)
+                        self.callback("bkz", progress, float(min(block, dimension)))
+            else:
+                _apply_block(max_block)
+                if self.callback:
+                    self.callback("bkz", 100.0, float(max_block))
+        except Exception as exc:
+            logger.error("BKZ reduction failed: %s", exc)
+            logger.info("Falling back to LLL reduction")
+            return self._run_lll(matrix)
+
+        return matrix
+
+
+class ComprehensiveKeyValidator:
+    """Validate candidate private keys against a public key."""
+
+    def __init__(self) -> None:
+        self.cache: Dict[Tuple[int, str], bool] = {}
+        self.parallel = True
+
+    def validate_key(self, private_key: int, public_key_hex: str) -> bool:
+        if not ECDSA_AVAILABLE:
+            return False
+
+        cache_key = (private_key, public_key_hex)
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        try:
+            target_point = decompress_public_key(public_key_hex)
+            candidate_point = private_key * G  # type: ignore[operator]
+            result = candidate_point == target_point
+            self.cache[cache_key] = result
+            return result
+        except Exception as exc:
+            logger.error("Validation error: %s", exc)
+            return False
+
+    def batch_validate(self, keys: List[int], public_key_hex: str) -> List[bool]:
+        if not self.parallel or len(keys) < 2:
+            return [self.validate_key(k, public_key_hex) for k in keys]
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(self.validate_key, key, public_key_hex) for key in keys]
+            results = []
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception:
+                    results.append(False)
+        return results
+
+
+class AdvancedCryptanalyzer:
+    """Coordinate lattice construction, reduction, ranking, and validation."""
+
+    def __init__(self) -> None:
+        self.lattice_builder = AdvancedLatticeBuilder()
+        self.reduction_engine = AdvancedReductionEngine()
+        self.ranker = AdvancedCandidateRanker()
+        self.validator = ComprehensiveKeyValidator()
+        self.client = EnhancedBlockchainClient()
+
+    def analyze_key(
+        self,
+        public_key_hex: str,
+        signatures: Optional[List[Tuple[bytes, int, int]]] = None,
+        source: str = "manual",
+        algorithm: str = "extended",
+    ) -> List[CandidateKey]:
+        logger.info("Starting comprehensive analysis for key: %s...", public_key_hex[:16])
+        start = time.time()
+
+        if not signatures and public_key_hex.startswith(("1", "3", "bc1", "tb1")):
+            signatures = self.client.get_signatures_for_address(public_key_hex)
+
+        lattice_matrix = self.lattice_builder.construct_lattice_from_signatures(
+            public_key_hex, signatures, algorithm
+        )
+        if not lattice_matrix:
+            logger.error("Failed to construct lattice matrix")
+            return []
+
+        def callback(stage: str, progress: float, metric: float) -> None:
+            logger.debug("Reduction %s: %.2f%% (metric %.2f)", stage, progress, metric)
+
+        reduced_matrix = self.reduction_engine.reduce_lattice(
+            lattice_matrix, algorithm="progressive_bkz", callback=callback
+        )
+        if not reduced_matrix:
+            logger.error("Lattice reduction failed")
+            return []
+
+        candidates = self._extract_candidates_from_lattice(reduced_matrix)
+        ranked = self.ranker.rank_candidates(candidates)
+        validated = self._validate_and_score_candidates(ranked, public_key_hex)
+
+        duration = time.time() - start
+        logger.info("Analysis completed in %.2f seconds", duration)
+        logger.info(
+            "Generated %d candidates, %d passed validation",
+            len(candidates),
+            len([candidate for candidate in validated if candidate.validation_result]),
+        )
+        return validated
+
+    def _extract_candidates_from_lattice(
+        self, lattice_matrix: IntegerMatrix
+    ) -> List[CandidateKey]:
+        candidates: List[CandidateKey] = []
+        rows = _integer_matrix_rows(lattice_matrix)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(self._extract_candidates_from_row, row, idx)
+                for idx, row in enumerate(rows)
+                if row
+            ]
+            for future in as_completed(futures):
+                try:
+                    candidates.extend(future.result())
+                except Exception as exc:
+                    logger.error("Candidate extraction failed: %s", exc)
+        return candidates
+
+    def _extract_candidates_from_row(self, row: List[int], row_index: int) -> List[CandidateKey]:
+        candidates: List[CandidateKey] = []
+        seen: set[int] = set()
+
+        if not row:
+            return candidates
+
+        for value in [row[-1], *row]:
+            candidate = abs(value) % n
+            if not candidate or candidate in seen:
+                continue
+            confidence = self._calculate_row_confidence(row, candidate)
+            if confidence > MIN_CONFIDENCE:
+                candidates.append(
+                    CandidateKey(
+                        key=candidate,
+                        confidence=confidence,
+                        source="row_element",
+                        metadata={"row": row, "row_index": row_index},
+                    )
+                )
+            seen.add(candidate)
+        return candidates
+
+    def _calculate_row_confidence(self, row: List[int], candidate: int) -> float:
+        try:
+            row_array = np.array([abs(x) for x in row], dtype=np.float64)
+            row_array = np.nan_to_num(row_array)
+            total = float(np.sum(row_array)) or 1.0
+            max_val = float(np.max(row_array)) or 1.0
+            distance = abs(candidate - (n // 2))
+            normalized_distance = min(1.0, distance / (n / 2))
+            skewness = float(skew(row_array)) if row_array.size > 3 else 0.0
+            small_coeffs = float(np.sum(row_array < 1000))
+            lattice_score = 1.0 / (1.0 + max_val)
+            confidence = (
+                0.4 * lattice_score
+                + 0.3 * (1.0 - normalized_distance)
+                + 0.2 * (small_coeffs / max(1, len(row)))
+                + 0.1 * (1.0 / (1.0 + abs(skewness)))
+            )
+            return float(min(1.0, max(0.0, confidence)))
+        except Exception:
+            return MIN_CONFIDENCE
+
+    def _validate_and_score_candidates(
+        self, candidates: List[Tuple[CandidateKey, float]], public_key_hex: str
+    ) -> List[CandidateKey]:
+        if not candidates:
+            return []
+
+        top = candidates[: min(20, len(candidates))]
+        validation_targets = [candidate.key for candidate, _ in top]
+        results = self.validator.batch_validate(validation_targets, public_key_hex)
+
+        validated: List[CandidateKey] = []
+        for (candidate, _), is_valid in zip(top, results):
+            candidate.validation_result = is_valid
+            candidate.confidence = candidate.confidence * (2.0 if is_valid else 0.5)
+            validated.append(candidate)
+            if is_valid:
+                logger.info("Found valid key: %d", candidate.key)
+        return validated
+
+
+def _integer_matrix_rows(matrix: IntegerMatrix) -> List[List[int]]:
+    rows: List[List[int]] = []
+    for i in range(matrix.nrows):
+        rows.append([matrix[i, j] for j in range(matrix.ncols)])
+    return rows
+
+
+def decompress_public_key(public_key_hex: str) -> Point:
+    if not ECDSA_AVAILABLE:
+        raise ValueError("fastecdsa is required to decompress public keys")
+    if not public_key_hex:
+        raise ValueError("Empty public key")
+
+    public_key_hex = public_key_hex.strip()
+    if len(public_key_hex) == 66:
+        prefix = int(public_key_hex[:2], 16)
+        x = int(public_key_hex[2:], 16)
+    elif len(public_key_hex) == 130:
+        prefix = int(public_key_hex[:2], 16)
+        x = int(public_key_hex[2:66], 16)
+    else:
+        raise ValueError("Invalid public key length")
+
+    if prefix not in (2, 3, 4):
+        raise ValueError("Invalid compressed public key prefix")
+
+    alpha = (pow(x, 3, p) + 7) % p
+    beta = pow(alpha, (p + 1) // 4, p)
+    if (beta % 2 == 0 and prefix == 3) or (beta % 2 == 1 and prefix == 2):
+        beta = (-beta) % p
+
+    point = Point(x, beta, curve=secp256k1)
+    if prefix == 4 and point.y != int(public_key_hex[66:], 16):
+        raise ValueError("Invalid uncompressed public key")
+    return point
+
+
+def parse_der_signature(signature: bytes) -> Optional[Tuple[int, int]]:
+    if not signature or len(signature) < 2:
         return None
     g = nx.DiGraph()
     curves = {
