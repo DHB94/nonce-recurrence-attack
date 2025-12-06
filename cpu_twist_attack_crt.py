@@ -28,6 +28,7 @@ try:
         GF,
         ZZ,
         discrete_log,
+        factor,
         randint,
         set_random_seed,
         kronecker_symbol,
@@ -57,7 +58,6 @@ TARGET_CURVES = 1000           # More curves for better coverage
 BATCH_SIZE = 50                # Larger batches for parallel processing
 WORKERS = min(16, cpu_count()) # More workers for faster processing
 MIN_CURVE_ORDER = 50           # Lowered minimum curve order for more candidates
-MAX_SUBGROUP_PRIME = 5000      # Upper bound for subgroup search
 
 # Console for rich output
 console = Console()
@@ -195,56 +195,6 @@ class CurveResult:
     order: int
     partials: List[PartialResidue]
 
-
-def find_small_prime_factors(n: int, limit: int) -> List[int]:
-    """Find small prime factors of ``n`` up to ``limit`` using trial division.
-
-    This avoids full integer factorization (which is often infeasible for large
-    twist orders) while still surfacing the small subgroup candidates we care
-    about for discrete-log residue extraction.
-    """
-
-    factors: List[int] = []
-    candidate = 2
-
-    while candidate * candidate <= n and candidate <= limit:
-        if n % candidate == 0:
-            factors.append(candidate)
-            while n % candidate == 0:
-                n //= candidate
-        candidate = 3 if candidate == 2 else candidate + 2
-
-    if n > 1 and n <= limit:
-        factors.append(int(n))
-
-    return factors
-
-
-def derive_subgroup_generator(curve, cofactor: int, subgroup_order: int):
-    """Derive a generator for the subgroup of order ``subgroup_order``.
-
-    We repeatedly sample random points, scale by the cofactor, and keep the
-    first non-zero point that has the desired order. This is more resilient
-    than relying on ``curve.gens()[0]`` directly belonging to the subgroup.
-    """
-
-    for _ in range(16):
-        candidate = cofactor * curve.random_point()
-        if candidate.is_zero():
-            continue
-
-        order = candidate.order()
-        if order == subgroup_order:
-            return candidate
-
-        # If the order divides the subgroup order, attempt to scale up.
-        if subgroup_order % order == 0:
-            scaled = (subgroup_order // order) * candidate
-            if not scaled.is_zero() and scaled.order() == subgroup_order:
-                return scaled
-
-    return None
-
 def tonelli_shanks(n: int, p: int) -> Optional[int]:
     """Tonelli-Shanks algorithm for modular square roots"""
     if p == 2:
@@ -373,49 +323,49 @@ def analyze_curve_for_subgroups(name: str, a4: int, a6: int) -> Optional[CurveRe
             try:
                 point = curve((x_val, y_val))
 
-                factors = find_small_prime_factors(order, MAX_SUBGROUP_PRIME)
+                if order < 10**18:  # Increased limit for factorization
+                    factors = factor(order)
 
-                for p_int in factors:
-                    if p_int < 10:
-                        continue
+                    for p, e in factors:
+                        p_int = int(p)
 
-                    try:
-                        cofactor = order // p_int
-                        if cofactor == 0:
-                            continue
+                        if 10 <= p_int <= 5000:  # Increased range for subgroup sizes
+                            try:
+                                cofactor = order // p_int
+                                if cofactor == 0:
+                                    continue
 
-                        subgroup_point = cofactor * point
-                        if subgroup_point.is_zero():
-                            continue
+                                subgroup_point = cofactor * point
+                                if subgroup_point.is_zero():
+                                    continue
 
-                        subgroup_gen = derive_subgroup_generator(curve, cofactor, p_int)
-                        if subgroup_gen is None:
-                            console.print(
-                                f"[yellow]Unable to derive subgroup generator of order {p_int} for {name}[/]"
-                            )
-                            continue
+                                gen = curve.gens()[0]
+                                subgroup_gen = cofactor * gen
 
-                        dl = discrete_log(
-                            subgroup_point,
-                            subgroup_gen,
-                            ord=p_int,
-                            operation='+'
-                        )
+                                if subgroup_gen.is_zero() or subgroup_gen.order() != p_int:
+                                    continue
 
-                        residue = int(dl) % p_int
-
-                        if residue * subgroup_gen == subgroup_point:
-                            partials.append(
-                                PartialResidue(
-                                    residue=residue,
-                                    modulus=p_int,
-                                    source=name,
-                                    verified=True
+                                dl = discrete_log(
+                                    subgroup_point,
+                                    subgroup_gen,
+                                    ord=p_int,
+                                    operation='+'
                                 )
-                            )
 
-                    except Exception as e:
-                        console.print(f"[red]Error in discrete log for {name}: {e}[/]")
+                                residue = int(dl) % p_int
+
+                                if residue * subgroup_gen == subgroup_point:
+                                    partials.append(
+                                        PartialResidue(
+                                            residue=residue,
+                                            modulus=p_int,
+                                            source=name,
+                                            verified=True
+                                        )
+                                    )
+
+                            except Exception as e:
+                                console.print(f"[red]Error in discrete log for {name}: {e}[/]")
 
             except Exception as e:
                 console.print(f"[red]Error analyzing curve {name}: {e}[/]")
