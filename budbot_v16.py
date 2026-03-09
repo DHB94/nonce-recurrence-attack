@@ -278,8 +278,7 @@ class SigRecord:
         self.txid=txid; self.vin_idx=vin_idx
         self.R=R; self.S=S; self.Z=Z; self.pubkey_hex=pub
     def csv_row(self):
-        return (self.txid[:20], f"{self.R:064x}", f"{self.S:064x}",
-                f"{self.Z:064x}", self.pubkey_hex)
+        return (str(self.R), str(self.S), str(self.Z), self.pubkey_hex)
 
 def _pub_from_witness(w):
     for item in w:
@@ -661,18 +660,32 @@ def adaptive_search(
 # CSV I/O
 # =============================================================================
 def write_csv(path, rows):
-    with path.open("w", newline="") as f: csv.writer(f).writerows(rows)
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(("r", "s", "z", "pubkey"))
+        w.writerows(rows)
 
 def load_csv(path, limit=None):
     msgs, sigs, pubs = [], [], []
+
+    def _parse_int(v: str) -> int:
+        v = v.strip().lower()
+        if v.startswith("0x"):
+            return int(v, 16)
+        if all(c in "0123456789abcdef" for c in v) and any(c in "abcdef" for c in v):
+            return int(v, 16)
+        return int(v, 10)
+
     with path.open(newline="") as f:
         for n, row in enumerate(csv.reader(f)):
             if limit is not None and n >= limit: break
             row = [c.strip() for c in row if c.strip()]
+            if row and row[0].lower() in {"r", "txid"}:
+                continue
             if len(row) >= 5:   _, R, S, Z, pub = row[0],row[1],row[2],row[3],row[4]
             elif len(row) == 4: R, S, Z, pub = row
             else: continue
-            msgs.append(int(Z,16)); sigs.append((int(R,16),int(S,16))); pubs.append(pub)
+            msgs.append(_parse_int(Z)); sigs.append((_parse_int(R), _parse_int(S))); pubs.append(pub)
     if not msgs: raise ValueError(f"No valid rows in {path}")
     return msgs, sigs, pubs
 
@@ -696,7 +709,7 @@ def generate_demo_csv(out, bits, n_sigs, msg="BudBot"):
             s = modinv(k, ORDER) * (z + d * r) % ORDER
             if s == 0: continue
             break
-        rows.append((f"demotx_{i:04d}", f"{r:064x}", f"{s:064x}", f"{z:064x}", pub))
+        rows.append((str(r), str(s), str(z), pub))
     write_csv(out, rows); return d
 
 # =============================================================================
