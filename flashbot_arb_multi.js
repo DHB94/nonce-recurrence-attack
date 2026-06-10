@@ -9,7 +9,7 @@ dotenv.config();
 const RPC_LIST = (
   process.env.RPC_LIST ||
   process.env.WRITE_RPC ||
-  "https://polygon-rpc.com,https://rpc.ankr.com/polygon,https://1rpc.io/matic"
+  "https://polygon-bor-rpc.publicnode.com,https://polygon.drpc.org,https://polygon-rpc.com,https://rpc.ankr.com/polygon"
 )
   .split(",")
   .map(s => s.trim())
@@ -160,6 +160,19 @@ interface IBalancerVault {
     ) external returns (uint256);
 }
 
+interface IBalancerV3Router {
+    function swapSingleTokenExactIn(
+        address pool,
+        address tokenIn,
+        address tokenOut,
+        uint256 exactAmountIn,
+        uint256 minAmountOut,
+        uint256 deadline,
+        bool wethIsEth,
+        bytes calldata userData
+    ) external returns (uint256 amountOut);
+}
+
 contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
     address public immutable owner;
     bool private locked;
@@ -229,7 +242,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
         require(msg.sender == owner, "only owner");
         require(routerA != address(0) && routerB != address(0), "invalid routers");
         require(path1.length >= 2 && path2.length >= 2, "invalid paths");
-        require(typeA <= 2 && typeB <= 2, "invalid types");
+        require(typeA <= 3 && typeB <= 3, "invalid types");
 
         pRouterA = routerA; pRouterB = routerB;
         pPath1 = path1; pPath2 = path2;
@@ -289,7 +302,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
                 emit SwapFailed(pRouterA, "unknown");
                 revert("Curve swap A failed");
             }
-        } else {
+        } else if (pTypeA == 2) {
             safeApprove(IERC20(asset), pRouterA, amount);
             IBalancerVault.SingleSwap memory swapA = IBalancerVault.SingleSwap({
                 poolId: pBalPoolIdA, kind: 0, assetIn: pPath1[0], assetOut: pPath1[1],
@@ -303,10 +316,24 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
                 out1 = result;
             } catch Error(string memory reason) {
                 emit SwapFailed(pRouterA, reason);
-                revert(string(abi.encodePacked("Balancer swap A failed: ", reason)));
+                revert(string(abi.encodePacked("BalV2 swap A failed: ", reason)));
             } catch (bytes memory) {
                 emit SwapFailed(pRouterA, "unknown");
-                revert("Balancer swap A failed");
+                revert("BalV2 swap A failed");
+            }
+        } else {
+            safeApprove(IERC20(asset), pRouterA, amount);
+            try IBalancerV3Router(pRouterA).swapSingleTokenExactIn(
+                address(bytes20(pBalPoolIdA)), pPath1[0], pPath1[1],
+                amount, pMinOut1, block.timestamp, false, ""
+            ) returns (uint256 result) {
+                out1 = result;
+            } catch Error(string memory reason) {
+                emit SwapFailed(pRouterA, reason);
+                revert(string(abi.encodePacked("BalV3 swap A failed: ", reason)));
+            } catch (bytes memory) {
+                emit SwapFailed(pRouterA, "unknown");
+                revert("BalV3 swap A failed");
             }
         }
         emit Leg1(pRouterA, pTypeA, pPath1, amount, pMinOut1, out1);
@@ -338,7 +365,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
                 emit SwapFailed(pRouterB, "unknown");
                 revert("Curve swap B failed");
             }
-        } else {
+        } else if (pTypeB == 2) {
             safeApprove(IERC20(pPath2[0]), pRouterB, out1);
             IBalancerVault.SingleSwap memory swapB = IBalancerVault.SingleSwap({
                 poolId: pBalPoolIdB, kind: 0, assetIn: pPath2[0], assetOut: pPath2[1],
@@ -352,10 +379,24 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
                 out2 = result;
             } catch Error(string memory reason) {
                 emit SwapFailed(pRouterB, reason);
-                revert(string(abi.encodePacked("Balancer swap B failed: ", reason)));
+                revert(string(abi.encodePacked("BalV2 swap B failed: ", reason)));
             } catch (bytes memory) {
                 emit SwapFailed(pRouterB, "unknown");
-                revert("Balancer swap B failed");
+                revert("BalV2 swap B failed");
+            }
+        } else {
+            safeApprove(IERC20(pPath2[0]), pRouterB, out1);
+            try IBalancerV3Router(pRouterB).swapSingleTokenExactIn(
+                address(bytes20(pBalPoolIdB)), pPath2[0], pPath2[1],
+                out1, pMinOut2, block.timestamp, false, ""
+            ) returns (uint256 result) {
+                out2 = result;
+            } catch Error(string memory reason) {
+                emit SwapFailed(pRouterB, reason);
+                revert(string(abi.encodePacked("BalV3 swap B failed: ", reason)));
+            } catch (bytes memory) {
+                emit SwapFailed(pRouterB, "unknown");
+                revert("BalV3 swap B failed");
             }
         }
         emit Leg2(pRouterB, pTypeB, pPath2, out1, pMinOut2, out2);
@@ -430,6 +471,9 @@ const CURVE_POOL_ABI = [
 ];
 const BALANCER_VAULT_ABI = [
   "function queryBatchSwap(uint8 kind, tuple(bytes32 poolId,uint256 assetInIndex,uint256 assetOutIndex,uint256 amount,bytes userData)[] swaps, address[] assets, tuple(address sender,bool fromInternalBalance,address recipient,bool toInternalBalance) funds) external view returns (int256[] memory)"
+];
+const BALANCER_V3_ROUTER_ABI = [
+  "function querySwapSingleTokenExactIn(address pool, address tokenIn, address tokenOut, uint256 exactAmountIn, address sender, bytes calldata userData) external returns (uint256 amountOut)"
 ];
 const PROVIDER_ABI = ["function getPool() view returns (address)"];
 const POOL_ABI = ["function FLASHLOAN_PREMIUM_TOTAL() view returns (uint128)"];
@@ -550,13 +594,27 @@ const CURVE_POOLS = [
   }
 ];
 
-const BALANCER_VAULT = {
+// Balancer V2 Vault (deployed on Polygon & most chains)
+const BALANCER_V2_VAULT = {
   name: "BalancerV2",
   address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
-  type: "balancer"
+  type: "balancerV2"
 };
 
-// Load real Balancer pool IDs from config
+// Balancer V3 Router addresses per chain (V3 not on Polygon yet)
+const BALANCER_V3_ROUTERS = {
+  mainnet: "0xAE563E3f8219521950555F5962419C8919758Ea2",
+  arbitrum: "0xAE563E3f8219521950555F5962419C8919758Ea2",
+  base: "0xAE563E3f8219521950555F5962419C8919758Ea2",
+  optimism: "0xAE563E3f8219521950555F5962419C8919758Ea2",
+  gnosis: "0xAE563E3f8219521950555F5962419C8919758Ea2",
+  avalanche: "0xAE563E3f8219521950555F5962419C8919758Ea2"
+};
+
+const CHAIN_NAME = (process.env.CHAIN_NAME || "polygon").toLowerCase();
+const BALANCER_V3_ROUTER_ADDR = BALANCER_V3_ROUTERS[CHAIN_NAME] || null;
+
+// Load Balancer pool configs from JSON (supports both V2 poolId and V3 pool address)
 let BALANCER_POOLS = [];
 try {
   if (fs.existsSync("balancer_pools.json")) {
@@ -573,6 +631,17 @@ function findBalancerPoolId(tokenA, tokenB) {
   for (const pool of BALANCER_POOLS) {
     const t = pool.tokens.map(x => x.toLowerCase());
     if (t.includes(a) && t.includes(b)) return pool.poolId;
+  }
+  return null;
+}
+
+function findBalancerV3Pool(tokenA, tokenB) {
+  const a = tokenA.toLowerCase();
+  const b = tokenB.toLowerCase();
+  for (const pool of BALANCER_POOLS) {
+    if (!pool.v3Address) continue;
+    const t = pool.tokens.map(x => x.toLowerCase());
+    if (t.includes(a) && t.includes(b)) return pool.v3Address;
   }
   return null;
 }
@@ -614,14 +683,28 @@ function buildCurvePools(currentProvider) {
   }));
 }
 
-function buildBalancer(currentProvider) {
+function buildBalancerV2(currentProvider) {
   return {
     name: "BalancerV2",
-    address: BALANCER_VAULT.address,
-    type: "balancer",
+    address: BALANCER_V2_VAULT.address,
+    type: "balancerV2",
     contract: new ethers.Contract(
-      BALANCER_VAULT.address,
+      BALANCER_V2_VAULT.address,
       BALANCER_VAULT_ABI,
+      currentProvider
+    )
+  };
+}
+
+function buildBalancerV3(currentProvider) {
+  if (!BALANCER_V3_ROUTER_ADDR) return null;
+  return {
+    name: "BalancerV3",
+    address: BALANCER_V3_ROUTER_ADDR,
+    type: "balancerV3",
+    contract: new ethers.Contract(
+      BALANCER_V3_ROUTER_ADDR,
+      BALANCER_V3_ROUTER_ABI,
       currentProvider
     )
   };
@@ -663,7 +746,7 @@ async function quoteCurve(pool, amountIn, path) {
   }
 }
 
-async function quoteBalancer(vault, amountIn, path) {
+async function quoteBalancerV2(vault, amountIn, path) {
   if (path.length !== 2) return { out: 0n, poolId: null };
   const poolId = findBalancerPoolId(path[0], path[1]);
   if (!poolId) return { out: 0n, poolId: null };
@@ -694,6 +777,20 @@ async function quoteBalancer(vault, amountIn, path) {
   }
 }
 
+async function quoteBalancerV3(router, amountIn, path) {
+  if (path.length !== 2) return { out: 0n, poolAddr: null };
+  const poolAddr = findBalancerV3Pool(path[0], path[1]);
+  if (!poolAddr) return { out: 0n, poolAddr: null };
+  try {
+    const out = await router.contract.querySwapSingleTokenExactIn.staticCall(
+      poolAddr, path[0], path[1], amountIn, ethers.ZeroAddress, "0x"
+    );
+    return { out: BigInt(out), poolAddr };
+  } catch (_) {
+    return { out: 0n, poolAddr };
+  }
+}
+
 async function quoteVenue(venue, amountIn, path) {
   if (venue.type === "v2") {
     const out = await quoteV2(venue, amountIn, path);
@@ -703,9 +800,13 @@ async function quoteVenue(venue, amountIn, path) {
     const q = await quoteCurve(venue, amountIn, path);
     return { out: q.out, meta: { curveI: q.i, curveJ: q.j } };
   }
-  if (venue.type === "balancer") {
-    const q = await quoteBalancer(venue, amountIn, path);
+  if (venue.type === "balancerV2") {
+    const q = await quoteBalancerV2(venue, amountIn, path);
     return { out: q.out, meta: { poolId: q.poolId } };
+  }
+  if (venue.type === "balancerV3") {
+    const q = await quoteBalancerV3(venue, amountIn, path);
+    return { out: q.out, meta: { poolAddr: q.poolAddr } };
   }
   return { out: 0n, meta: {} };
 }
@@ -784,7 +885,9 @@ async function main() {
     );
     routers = buildRouters(provider);
     curvePools = buildCurvePools(provider);
-    balancer = buildBalancer(provider);
+    balancerV2 = buildBalancerV2(provider);
+    const maybeV3 = buildBalancerV3(provider);
+    if (maybeV3) balancerV3 = maybeV3;
   }
 
   async function getPoolAddr() {
@@ -815,14 +918,16 @@ async function main() {
 
   let routers = buildRouters(provider);
   let curvePools = buildCurvePools(provider);
-  let balancer = buildBalancer(provider);
-  console.log(
-    "📡 Venues: " +
-      routers.map(r => r.name).join(", ") +
-      " | " +
-      curvePools.map(p => p.name).join(", ") +
-      " | BalancerV2"
-  );
+  let balancerV2 = buildBalancerV2(provider);
+  let balancerV3 = buildBalancerV3(provider);
+  const venueNames = [
+    ...routers.map(r => r.name),
+    ...curvePools.map(p => p.name),
+    "BalancerV2",
+    ...(balancerV3 ? ["BalancerV3"] : [])
+  ];
+  console.log("📡 Venues: " + venueNames.join(", "));
+  if (!balancerV3) console.log("ℹ️  Balancer V3 not available on " + CHAIN_NAME + " (V2 only)");
 
   const cooldown = new Map();
   const successHistory = new Map();
@@ -874,7 +979,7 @@ async function main() {
         const premium = (size * premiumBps) / 10000n;
         const owed = size + premium;
 
-        const venues = [...routers, ...curvePools, balancer];
+        const venues = [...routers, ...curvePools, balancerV2, ...(balancerV3 ? [balancerV3] : [])];
         let best = { out2: 0n };
         const paths1 = generatePaths(token.asset, TARGET);
         const paths2 = generatePaths(TARGET, token.asset);
@@ -930,22 +1035,35 @@ async function main() {
 
         const minOut1 = applySlippage(best.out1);
         const minOut2 = applySlippage(best.out2);
-        const typeA =
-          best.aType === "v2" ? 0 : best.aType === "curve" ? 1 : 2;
-        const typeB =
-          best.bType === "v2" ? 0 : best.bType === "curve" ? 1 : 2;
-        const routerA = typeA === 2 ? BALANCER_VAULT.address : best.aAddr;
-        const routerB = typeB === 2 ? BALANCER_VAULT.address : best.bAddr;
+        function venueType(t) {
+          if (t === "v2") return 0;
+          if (t === "curve") return 1;
+          if (t === "balancerV2") return 2;
+          if (t === "balancerV3") return 3;
+          return 0;
+        }
+        const typeA = venueType(best.aType);
+        const typeB = venueType(best.bType);
+        const routerA =
+          typeA === 2 ? BALANCER_V2_VAULT.address
+            : typeA === 3 ? BALANCER_V3_ROUTER_ADDR
+            : best.aAddr;
+        const routerB =
+          typeB === 2 ? BALANCER_V2_VAULT.address
+            : typeB === 3 ? BALANCER_V3_ROUTER_ADDR
+            : best.bAddr;
         const curveI1 = BigInt(best.aMeta.curveI ?? 0);
         const curveJ1 = BigInt(best.aMeta.curveJ ?? 1);
         const curveI2 = BigInt(best.bMeta.curveI ?? 0);
         const curveJ2 = BigInt(best.bMeta.curveJ ?? 1);
-        const balPidA =
-          best.aMeta.poolId ||
-          "0x0000000000000000000000000000000000000000000000000000000000000000";
-        const balPidB =
-          best.bMeta.poolId ||
-          "0x0000000000000000000000000000000000000000000000000000000000000000";
+        // V2 uses poolId (bytes32), V3 uses pool address (left-padded into bytes32)
+        const ZERO_ID = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        const balPidA = typeA === 3
+          ? ethers.zeroPadValue(best.aMeta.poolAddr || ethers.ZeroAddress, 32)
+          : (best.aMeta.poolId || ZERO_ID);
+        const balPidB = typeB === 3
+          ? ethers.zeroPadValue(best.bMeta.poolAddr || ethers.ZeroAddress, 32)
+          : (best.bMeta.poolId || ZERO_ID);
 
         try {
           console.log(
