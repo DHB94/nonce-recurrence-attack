@@ -324,7 +324,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
         } else {
             safeApprove(IERC20(asset), pRouterA, amount);
             try IBalancerV3Router(pRouterA).swapSingleTokenExactIn(
-                address(bytes20(pBalPoolIdA)), pPath1[0], pPath1[1],
+                address(uint160(uint256(pBalPoolIdA))), pPath1[0], pPath1[1],
                 amount, pMinOut1, block.timestamp, false, ""
             ) returns (uint256 result) {
                 out1 = result;
@@ -387,7 +387,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
         } else {
             safeApprove(IERC20(pPath2[0]), pRouterB, out1);
             try IBalancerV3Router(pRouterB).swapSingleTokenExactIn(
-                address(bytes20(pBalPoolIdB)), pPath2[0], pPath2[1],
+                address(uint160(uint256(pBalPoolIdB))), pPath2[0], pPath2[1],
                 out1, pMinOut2, block.timestamp, false, ""
             ) returns (uint256 result) {
                 out2 = result;
@@ -601,14 +601,14 @@ const BALANCER_V2_VAULT = {
   type: "balancerV2"
 };
 
-// Balancer V3 Router addresses per chain (V3 not on Polygon yet)
+// Balancer V3 Router V2 addresses per chain (V3 not on Polygon yet)
 const BALANCER_V3_ROUTERS = {
   mainnet: "0xAE563E3f8219521950555F5962419C8919758Ea2",
-  arbitrum: "0xAE563E3f8219521950555F5962419C8919758Ea2",
-  base: "0xAE563E3f8219521950555F5962419C8919758Ea2",
-  optimism: "0xAE563E3f8219521950555F5962419C8919758Ea2",
-  gnosis: "0xAE563E3f8219521950555F5962419C8919758Ea2",
-  avalanche: "0xAE563E3f8219521950555F5962419C8919758Ea2"
+  arbitrum: "0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E",
+  base: "0x3f170631ed9821Ca51A59D996aB095162438DC10",
+  optimism: "0xe2fa4e1d17725e72dcdAfe943Ecf45dF4B9E285b",
+  gnosis: "0x4eff2d77D9fFbAeFB4b141A3e494c085b3FF4Cb5",
+  avalanche: "0xF39CA6ede9BF7820a952b52f3c94af526bAB9015"
 };
 
 const CHAIN_NAME = (process.env.CHAIN_NAME || "polygon").toLowerCase();

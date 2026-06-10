@@ -57,6 +57,37 @@ const CURVE_POOL_ABI = [
 const BALANCER_VAULT_ABI = [
   "function queryBatchSwap(uint8 kind, tuple(bytes32 poolId,uint256 assetInIndex,uint256 assetOutIndex,uint256 amount,bytes userData)[] swaps, address[] assets, tuple(address sender,bool fromInternalBalance,address recipient,bool toInternalBalance) funds) external view returns (int256[] memory)"
 ];
+const fs = require("fs");
+let BALANCER_POOLS = [];
+try {
+  if (fs.existsSync("balancer_pools.json")) {
+    BALANCER_POOLS = JSON.parse(fs.readFileSync("balancer_pools.json", "utf8"));
+  }
+} catch (_) {}
+
+function findBalancerPoolId(tokenA, tokenB) {
+  const a = tokenA.toLowerCase();
+  const b = tokenB.toLowerCase();
+  for (const pool of BALANCER_POOLS) {
+    const t = pool.tokens.map(x => x.toLowerCase());
+    if (t.includes(a) && t.includes(b)) return pool.poolId;
+  }
+  return null;
+}
+
+async function quoteBalancerV2(vault, amountIn, tokenIn, tokenOut) {
+  const poolId = findBalancerPoolId(tokenIn, tokenOut);
+  if (!poolId) return 0n;
+  try {
+    const swaps = [{ poolId, assetInIndex: 0, assetOutIndex: 1, amount: amountIn, userData: "0x" }];
+    const assets = [tokenIn, tokenOut];
+    const funds = { sender: ethers.ZeroAddress, fromInternalBalance: false, recipient: ethers.ZeroAddress, toInternalBalance: false };
+    const deltas = await vault.queryBatchSwap(0, swaps, assets, funds);
+    const out = typeof deltas[1] === "bigint" ? -deltas[1] : -BigInt(deltas[1]);
+    return out > 0n ? out : 0n;
+  } catch (_) { return 0n; }
+}
+
 const PROVIDER_ABI = ["function getPool() view returns (address)"];
 const POOL_ABI = ["function FLASHLOAN_PREMIUM_TOTAL() view returns (uint128)"];
 const ERC20_ABI = ["function balanceOf(address) view returns (uint256)"];
@@ -105,6 +136,24 @@ async function main() {
   const premiumBps = BigInt(await pool.FLASHLOAN_PREMIUM_TOTAL());
   console.log(`\ud83c\udfe6 Aave pool: ${poolAddr} | premium: ${premiumBps} bps\n`);
 
+  // ======== V3 address encoding unit test ========
+  console.log("--- V3 Address Encoding Test ---");
+  const testAddr = "0xAE563E3f8219521950555F5962419C8919758Ea2";
+  const padded = ethers.zeroPadValue(testAddr, 32);
+  // Correct extraction: uint256 → uint160 → address (rightmost 20 bytes)
+  const extracted = ethers.getAddress("0x" + padded.slice(-40));
+  const match = extracted.toLowerCase() === testAddr.toLowerCase();
+  console.log(`  Input address:     ${testAddr}`);
+  console.log(`  Padded bytes32:    ${padded}`);
+  console.log(`  Extracted address: ${extracted}`);
+  console.log(`  Match: ${match ? "PASS" : "FAIL"}`);
+  // Verify bytes20 truncation would fail
+  const wrongAddr = "0x" + padded.slice(2, 42);
+  const wrongMatch = wrongAddr.toLowerCase() === testAddr.toLowerCase();
+  console.log(`  bytes20 truncation would give: ${wrongAddr} → ${wrongMatch ? "same (unexpected)" : "WRONG (expected)"}`);  
+  console.log(`  uint160(uint256()) gives correct address: ${match ? "PASS" : "FAIL"}\n`);
+  if (!match) { console.error("FATAL: V3 address encoding broken"); process.exit(1); }
+
   // Build venue contracts
   const v2Contracts = ROUTERS.map(r => ({
     name: r.name,
@@ -115,6 +164,8 @@ async function main() {
     coins: p.coins.map(toLower),
     contract: new ethers.Contract(p.address, CURVE_POOL_ABI, provider)
   }));
+  const balVault = new ethers.Contract(BALANCER_V2_VAULT, BALANCER_VAULT_ABI, provider);
+  console.log(`\ud83d\udccb Loaded ${BALANCER_POOLS.length} Balancer V2 pool(s)`);
 
   // Test amounts for each token type
   function getTestAmounts(symbol, decimals) {
@@ -189,6 +240,24 @@ async function main() {
             bestRoute = { aName: v2A.name, bName: curve.name, out1, out2 };
           }
         }
+
+        // Try Balancer V2 for leg 2
+        const balOut2 = await quoteBalancerV2(balVault, out1, toLower(TARGET), assetL);
+        if (balOut2 > bestRoute.out2) {
+          bestRoute = { aName: v2A.name, bName: "BalancerV2", out1, out2: balOut2 };
+        }
+      }
+
+      // Balancer V2 for leg 1
+      const balOut1 = await quoteBalancerV2(balVault, size, assetL, toLower(TARGET));
+      if (balOut1 > 0n) {
+        const returnPath = [toLower(TARGET), assetL];
+        for (const v2B of v2Contracts) {
+          const out2 = await quoteV2(v2B.contract, balOut1, returnPath);
+          if (out2 > bestRoute.out2) {
+            bestRoute = { aName: "BalancerV2", bName: v2B.name, out1: balOut1, out2 };
+          }
+        }
       }
 
       // Curve for leg 1 (stablecoins → stablecoins via Curve, return via V2)
@@ -249,7 +318,7 @@ async function main() {
   console.log(`\ud83d\udce1 Venues tested: ${v2Contracts.map(v => v.name).join(", ")}, ${curveContracts.map(c => c.name).join(", ")}`);
   console.log(`\ud83c\udfe6 Flash loan premium: ${premiumBps} bps`);
   console.log(`\u2139\ufe0f  Balancer V3 not available on Polygon (V2 only)`);
-  console.log(`\u2139\ufe0f  Balancer V2 quoting skipped (requires pool IDs in balancer_pools.json)\n`);
+  console.log(`\u2139\ufe0f  Balancer V2 quoting: ${BALANCER_POOLS.length} pools loaded\n`);
 
   if (profitableTests > 0) {
     console.log("\ud83d\udfe2 Profitable opportunities found:");
