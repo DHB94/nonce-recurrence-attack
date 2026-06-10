@@ -69,14 +69,13 @@ from sage.all import (
     EllipticCurve,
     GF,
     ZZ,
-    bsgs,
     crt,
     discrete_log,
-    discrete_log_rho,
     factor,
     inverse_mod,
     is_prime,
 )
+from sage.groups.generic import bsgs, discrete_log_rho
 
 # =============================================================================
 # Console
