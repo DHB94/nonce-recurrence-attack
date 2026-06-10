@@ -764,7 +764,7 @@ async function main() {
   console.log("🔍 RPC connected. Block:", await provider.getBlockNumber());
 
   const deployed = await deploy(provider, wallet, false);
-  const flashBot = new ethers.Contract(deployed.address, deployed.abi, wallet);
+  let flashBot = new ethers.Contract(deployed.address, deployed.abi, wallet);
   const iface = new ethers.Interface(deployed.abi);
 
   let providerContract = new ethers.Contract(
@@ -773,18 +773,26 @@ async function main() {
     provider
   );
 
+  async function reconnectAll() {
+    provider = await rotateRPC();
+    wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+    flashBot = flashBot.connect(wallet);
+    providerContract = new ethers.Contract(
+      process.env.AAVE_POOL_ADDRESSES_PROVIDER,
+      PROVIDER_ABI,
+      provider
+    );
+    routers = buildRouters(provider);
+    curvePools = buildCurvePools(provider);
+    balancer = buildBalancer(provider);
+  }
+
   async function getPoolAddr() {
     try {
       return await providerContract.getPool();
     } catch (_) {
       console.warn("⚠️ Failed to get pool address, rotating RPC...");
-      provider = await rotateRPC();
-      wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-      providerContract = new ethers.Contract(
-        process.env.AAVE_POOL_ADDRESSES_PROVIDER,
-        PROVIDER_ABI,
-        provider
-      );
+      await reconnectAll();
       return providerContract.getPool();
     }
   }
@@ -799,12 +807,6 @@ async function main() {
       );
       return 9n;
     }
-  }
-
-  async function rebuildVenues() {
-    routers = buildRouters(provider);
-    curvePools = buildCurvePools(provider);
-    balancer = buildBalancer(provider);
   }
 
   let poolAddr = await getPoolAddr();
@@ -846,9 +848,7 @@ async function main() {
       } catch (_) {
         console.warn(`⚠️ balanceOf failed for ${token.symbol}, rotating RPC...`);
         try {
-          provider = await rotateRPC();
-          wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-          await rebuildVenues();
+          await reconnectAll();
           poolAddr = await getPoolAddr();
           premiumBps = await getPremiumBps(poolAddr);
         } catch (e) {
@@ -1031,11 +1031,9 @@ async function main() {
       }
     }
 
-    // End-of-round: rotate RPC, refresh pool info
+    // End-of-round: rotate RPC, refresh pool info, reconnect flashBot
     try {
-      provider = await rotateRPC();
-      wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-      await rebuildVenues();
+      await reconnectAll();
       poolAddr = await getPoolAddr();
       premiumBps = await getPremiumBps(poolAddr);
     } catch (e) {
