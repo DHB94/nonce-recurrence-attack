@@ -750,14 +750,28 @@ def auto_fetch(address, out_csv, confirmed_only=False):
 # Terminal UI
 # =============================================================================
 _LOGO = [
-    "██████╗ ██╗   ██╗██████╗ ██████╗  ██████╗ ████████╗",
-    "██╔══██╗██║   ██║██╔══██╗██╔══██╗██╔═══██╗╚══██╔══╝",
-    "██████╔╝██║   ██║██║  ██║██████╔╝██║   ██║   ██║   ",
-    "██╔══██╗██║   ██║██║  ██║██╔══██╗██║   ██║   ██║   ",
-    "██████╔╝╚██████╔╝██████╔╝██████╔╝╚██████╔╝   ██║   ",
-    "╚═════╝  ╚═════╝ ╚═════╝ ╚═════╝  ╚═════╝    ╚═╝   ",
+    "╔══════════════════════════════════════════════════════════════════╗",
+    "║  ██████╗ ██╗   ██╗██████╗ ██████╗  ██████╗ ████████╗           ║",
+    "║  ██╔══██╗██║   ██║██╔══██╗██╔══██╗██╔═══██╗╚══██╔══╝           ║",
+    "║  ██████╔╝██║   ██║██║  ██║██████╔╝██║   ██║   ██║              ║",
+    "║  ██╔══██╗██║   ██║██║  ██║██╔══██╗██║   ██║   ██║              ║",
+    "║  ██████╔╝╚██████╔╝██████╔╝██████╔╝╚██████╔╝   ██║              ║",
+    "║  ╚═════╝  ╚═════╝ ╚═════╝ ╚═════╝  ╚═════╝    ╚═╝              ║",
+    "║                                                                  ║",
+    "║     ██╗     ██╗     ██╗         █████╗ ████████╗██╗  ██╗        ║",
+    "║     ██║     ██║     ██║        ██╔══██╗╚══██╔══╝██║ ██╔╝        ║",
+    "║     ██║     ██║     ██║        ███████║   ██║   █████╔╝         ║",
+    "║     ██║     ██║     ██║        ██╔══██║   ██║   ██╔═██╗         ║",
+    "║     ███████╗███████╗███████╗   ██║  ██║   ██║   ██║  ██╗        ║",
+    "║     ╚══════╝╚══════╝╚══════╝   ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝        ║",
+    "║                                                                  ║",
+    "║  ⚡ AI/ML Bias Detect · Variance Ranking · mempool.space ⚡     ║",
+    "║            secp256k1 ECDSA Nonce Recovery Engine v16              ║",
+    "╚══════════════════════════════════════════════════════════════════╝",
 ]
-_GLOW = ["#ff2a6d","#ff6b00","#ffd600","#00ff9f","#00e5ff","#bf5fff"]
+_GLOW = ["#ff2a6d", "#ff6b00", "#ffd600", "#00ff9f", "#00e5ff", "#bf5fff",
+         "#ff2a6d", "#ff6b00", "#ffd600", "#00ff9f", "#00e5ff", "#bf5fff",
+         "#ff2a6d", "#ff6b00", "#ffd600", "#00ff9f", "#00e5ff", "#bf5fff"]
 
 def _p(msg, **kw):
     if _HAS_RICH: _con.print(msg, **kw)
@@ -769,13 +783,10 @@ def print_banner():
         t = Text()
         for i, line in enumerate(_LOGO):
             t.append(line + "\n", style=Style(color=_GLOW[i%len(_GLOW)], bold=True))
-        t.append("  ⚡  AI/ML LLL Attack  ·  mempool.space  ·  v16  ⚡\n",
-                 style=Style(color="#00e5ff", italic=True, bold=True))
-        _con.print(Panel(t, border_style="bright_cyan",
-            subtitle="[dim cyan]secp256k1 · SageMath LLL/BKZ · n_distinct bias detect · variance subset rank[/]"))
+        _con.print(t)
         _con.print()
     else:
-        print("\n".join(_LOGO)); print("BudBot v16 – AI/ML LLL Attack + mempool.space\n")
+        print("\n".join(_LOGO)); print()
 
 def print_bias_table(diag):
     if _HAS_RICH:
