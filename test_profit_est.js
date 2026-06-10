@@ -1,52 +1,68 @@
 #!/usr/bin/env node
-// Profit estimation test — queries live Polygon RPCs and estimates flash loan arb profit
+// Profit estimation test — queries live Arbitrum RPCs and estimates flash loan arb profit
 // Usage: node test_profit_est.js
 // No private key or deployment required — read-only quoting only
 
 const { ethers } = require("ethers");
+const fs = require("fs");
 
-// ======== config ========
+// ======== config (Arbitrum) ========
 const RPC_LIST = [
-  "https://polygon-bor-rpc.publicnode.com",
-  "https://polygon.drpc.org",
-  "https://polygon-rpc.com",
-  "https://rpc.ankr.com/polygon"
+  "https://arb1.arbitrum.io/rpc",
+  "https://arbitrum-one-rpc.publicnode.com",
+  "https://arbitrum.drpc.org",
+  "https://rpc.ankr.com/arbitrum"
 ];
 const AAVE_PROVIDER = "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb";
-const WMATIC = "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270";
+const WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 
 const TOKENS = [
-  { symbol: "USDC", asset: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174", decimals: 6 },
-  { symbol: "WMATIC", asset: WMATIC, decimals: 18 },
-  { symbol: "DAI", asset: "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063", decimals: 18 },
-  { symbol: "USDT", asset: "0xc2132d05d31c914a87c6611c10748aeb04b58e8f", decimals: 6 },
-  { symbol: "WETH", asset: "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", decimals: 18 },
-  { symbol: "WBTC", asset: "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6", decimals: 8 },
-  { symbol: "LINK", asset: "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39", decimals: 18 },
-  { symbol: "AAVE", asset: "0xd6df932a45c0f255f85145f286ea0b292b21c90b", decimals: 18 }
+  { symbol: "USDC",   asset: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", decimals: 6 },
+  { symbol: "USDC.e", asset: "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8", decimals: 6 },
+  { symbol: "WETH",   asset: WETH, decimals: 18 },
+  { symbol: "DAI",    asset: "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1", decimals: 18 },
+  { symbol: "USDT",   asset: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", decimals: 6 },
+  { symbol: "WBTC",   asset: "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f", decimals: 8 },
+  { symbol: "ARB",    asset: "0x912CE59144191C1204E64559FE8253a0e49E6548", decimals: 18 },
+  { symbol: "LINK",   asset: "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4", decimals: 18 },
+  { symbol: "GMX",    asset: "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a", decimals: 18 },
+  { symbol: "wstETH", asset: "0x5979D7b546E38E414F7E9822514be443A4800529", decimals: 18 }
 ];
 
-const STABLECOINS = new Set(["USDC", "USDT", "DAI"]);
-const TARGET = WMATIC;
+const STABLECOINS = new Set(["USDC", "USDC.e", "USDT", "DAI"]);
+const TARGET = WETH;
 
 const ROUTERS = [
-  { name: "QuickSwapV2", address: "0xa5e0829caced8ffdd4de3c43696c57f7d7a678ff" },
-  { name: "SushiV2", address: "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506" }
+  { name: "UniswapV2", address: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24" },
+  { name: "SushiV2",   address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506" }
 ];
 
 const CURVE_POOLS = [
   {
-    name: "CurveAavePool",
-    address: "0x445FE580eF8d70FF569aB36e80c647af338db351",
+    name: "Curve2Pool",
+    address: "0x7f90122BF0700F9E7e1F688fe926940E8839F353",
     coins: [
-      "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
-      "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
-      "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
+      "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+      "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"
+    ]
+  }
+];
+
+// CurveCrypto pools use uint256 indices
+const CURVE_CRYPTO_POOLS = [
+  {
+    name: "CurveTricrypto",
+    address: "0x960ea3e3C7FB317332d990873d354E18d7645590",
+    coins: [
+      "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+      "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f",
+      "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
     ]
   }
 ];
 
 const BALANCER_V2_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
+const BALANCER_V3_ROUTER = "0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E";
 
 const V2_ROUTER_ABI = [
   "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)"
@@ -54,10 +70,16 @@ const V2_ROUTER_ABI = [
 const CURVE_POOL_ABI = [
   "function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256)"
 ];
+const CURVE_CRYPTO_ABI = [
+  "function get_dy(uint256 i, uint256 j, uint256 dx) external view returns (uint256)"
+];
 const BALANCER_VAULT_ABI = [
   "function queryBatchSwap(uint8 kind, tuple(bytes32 poolId,uint256 assetInIndex,uint256 assetOutIndex,uint256 amount,bytes userData)[] swaps, address[] assets, tuple(address sender,bool fromInternalBalance,address recipient,bool toInternalBalance) funds) external view returns (int256[] memory)"
 ];
-const fs = require("fs");
+const BALANCER_V3_ROUTER_ABI = [
+  "function querySwapSingleTokenExactIn(address pool, address tokenIn, address tokenOut, uint256 exactAmountIn, address sender, bytes calldata userData) external returns (uint256 amountOut)"
+];
+
 let BALANCER_POOLS = [];
 try {
   if (fs.existsSync("balancer_pools.json")) {
@@ -75,6 +97,17 @@ function findBalancerPoolId(tokenA, tokenB) {
   return null;
 }
 
+function findBalancerV3Pool(tokenA, tokenB) {
+  const a = tokenA.toLowerCase();
+  const b = tokenB.toLowerCase();
+  for (const pool of BALANCER_POOLS) {
+    if (!pool.v3Address) continue;
+    const t = pool.tokens.map(x => x.toLowerCase());
+    if (t.includes(a) && t.includes(b)) return pool.v3Address;
+  }
+  return null;
+}
+
 async function quoteBalancerV2(vault, amountIn, tokenIn, tokenOut) {
   const poolId = findBalancerPoolId(tokenIn, tokenOut);
   if (!poolId) return 0n;
@@ -86,6 +119,19 @@ async function quoteBalancerV2(vault, amountIn, tokenIn, tokenOut) {
     const out = typeof deltas[1] === "bigint" ? -deltas[1] : -BigInt(deltas[1]);
     return out > 0n ? out : 0n;
   } catch (_) { return 0n; }
+}
+
+async function quoteBalancerV3(router, amountIn, tokenIn, tokenOut) {
+  const poolAddr = findBalancerV3Pool(tokenIn, tokenOut);
+  if (!poolAddr) return { out: 0n, poolAddr: null };
+  try {
+    const out = await router.querySwapSingleTokenExactIn.staticCall(
+      poolAddr, tokenIn, tokenOut, amountIn, ethers.ZeroAddress, "0x"
+    );
+    return { out: BigInt(out), poolAddr };
+  } catch (_) {
+    return { out: 0n, poolAddr };
+  }
 }
 
 const PROVIDER_ABI = ["function getPool() view returns (address)"];
@@ -106,6 +152,15 @@ async function quoteV2(contract, amountIn, path) {
 }
 
 async function quoteCurve(contract, coins, amountIn, tokenIn, tokenOut) {
+  const i = coins.indexOf(toLower(tokenIn));
+  const j = coins.indexOf(toLower(tokenOut));
+  if (i === -1 || j === -1) return 0n;
+  try {
+    return BigInt(await contract.get_dy(i, j, amountIn));
+  } catch (_) { return 0n; }
+}
+
+async function quoteCurveCrypto(contract, coins, amountIn, tokenIn, tokenOut) {
   const i = coins.indexOf(toLower(tokenIn));
   const j = coins.indexOf(toLower(tokenOut));
   if (i === -1 || j === -1) return 0n;
@@ -140,17 +195,15 @@ async function main() {
   console.log("--- V3 Address Encoding Test ---");
   const testAddr = "0xAE563E3f8219521950555F5962419C8919758Ea2";
   const padded = ethers.zeroPadValue(testAddr, 32);
-  // Correct extraction: uint256 → uint160 → address (rightmost 20 bytes)
   const extracted = ethers.getAddress("0x" + padded.slice(-40));
   const match = extracted.toLowerCase() === testAddr.toLowerCase();
   console.log(`  Input address:     ${testAddr}`);
   console.log(`  Padded bytes32:    ${padded}`);
   console.log(`  Extracted address: ${extracted}`);
   console.log(`  Match: ${match ? "PASS" : "FAIL"}`);
-  // Verify bytes20 truncation would fail
   const wrongAddr = "0x" + padded.slice(2, 42);
   const wrongMatch = wrongAddr.toLowerCase() === testAddr.toLowerCase();
-  console.log(`  bytes20 truncation would give: ${wrongAddr} → ${wrongMatch ? "same (unexpected)" : "WRONG (expected)"}`);  
+  console.log(`  bytes20 truncation would give: ${wrongAddr} \u2192 ${wrongMatch ? "same (unexpected)" : "WRONG (expected)"}`);
   console.log(`  uint160(uint256()) gives correct address: ${match ? "PASS" : "FAIL"}\n`);
   if (!match) { console.error("FATAL: V3 address encoding broken"); process.exit(1); }
 
@@ -164,8 +217,16 @@ async function main() {
     coins: p.coins.map(toLower),
     contract: new ethers.Contract(p.address, CURVE_POOL_ABI, provider)
   }));
+  const curveCryptoContracts = CURVE_CRYPTO_POOLS.map(p => ({
+    name: p.name,
+    coins: p.coins.map(toLower),
+    contract: new ethers.Contract(p.address, CURVE_CRYPTO_ABI, provider)
+  }));
   const balVault = new ethers.Contract(BALANCER_V2_VAULT, BALANCER_VAULT_ABI, provider);
-  console.log(`\ud83d\udccb Loaded ${BALANCER_POOLS.length} Balancer V2 pool(s)`);
+  const balV3Router = new ethers.Contract(BALANCER_V3_ROUTER, BALANCER_V3_ROUTER_ABI, provider);
+  console.log(`\ud83d\udccb Loaded ${BALANCER_POOLS.length} Balancer pool(s)`);
+  const v3Pools = BALANCER_POOLS.filter(p => p.v3Address);
+  console.log(`   V3 pools: ${v3Pools.length}, V2 pools: ${BALANCER_POOLS.filter(p => p.poolId).length}`);
 
   // Test amounts for each token type
   function getTestAmounts(symbol, decimals) {
@@ -185,9 +246,9 @@ async function main() {
   let totalTests = 0;
   let profitableTests = 0;
 
-  console.log("=" .repeat(100));
+  console.log("=" .repeat(110));
   console.log("TOKEN     | SIZE          | LEG A           | LEG B           | OUT          | OWED         | EDGE BPS | EST PROFIT");
-  console.log("=" .repeat(100));
+  console.log("=" .repeat(110));
 
   for (const token of TOKENS) {
     const assetL = toLower(token.asset);
@@ -214,12 +275,10 @@ async function main() {
 
       // Quote leg 1: token → TARGET via each venue
       const directPath = [assetL, toLower(TARGET)];
-      const viaWmatic = assetL !== toLower(WMATIC)
-        ? [assetL, toLower(WMATIC)]
-        : null;
 
       let bestRoute = { out2: 0n };
 
+      // V2 routers for leg 1
       for (const v2A of v2Contracts) {
         const out1 = await quoteV2(v2A.contract, size, directPath);
         if (out1 <= 0n) continue;
@@ -233,7 +292,7 @@ async function main() {
           }
         }
 
-        // Also try Curve for leg 2 (stablecoins)
+        // Curve stable for leg 2
         for (const curve of curveContracts) {
           const out2 = await quoteCurve(curve.contract, curve.coins, out1, TARGET, token.asset);
           if (out2 > bestRoute.out2) {
@@ -241,10 +300,37 @@ async function main() {
           }
         }
 
-        // Try Balancer V2 for leg 2
+        // CurveCrypto for leg 2
+        for (const cc of curveCryptoContracts) {
+          const out2 = await quoteCurveCrypto(cc.contract, cc.coins, out1, TARGET, token.asset);
+          if (out2 > bestRoute.out2) {
+            bestRoute = { aName: v2A.name, bName: cc.name, out1, out2 };
+          }
+        }
+
+        // Balancer V2 for leg 2
         const balOut2 = await quoteBalancerV2(balVault, out1, toLower(TARGET), assetL);
         if (balOut2 > bestRoute.out2) {
           bestRoute = { aName: v2A.name, bName: "BalancerV2", out1, out2: balOut2 };
+        }
+
+        // Balancer V3 for leg 2
+        const balV3Out2 = await quoteBalancerV3(balV3Router, out1, toLower(TARGET), assetL);
+        if (balV3Out2.out > bestRoute.out2) {
+          bestRoute = { aName: v2A.name, bName: "BalancerV3", out1, out2: balV3Out2.out };
+        }
+      }
+
+      // CurveCrypto for leg 1
+      for (const cc of curveCryptoContracts) {
+        const out1 = await quoteCurveCrypto(cc.contract, cc.coins, size, token.asset, TARGET);
+        if (out1 <= 0n) continue;
+        const returnPath = [toLower(TARGET), assetL];
+        for (const v2B of v2Contracts) {
+          const out2 = await quoteV2(v2B.contract, out1, returnPath);
+          if (out2 > bestRoute.out2) {
+            bestRoute = { aName: cc.name, bName: v2B.name, out1, out2 };
+          }
         }
       }
 
@@ -260,7 +346,19 @@ async function main() {
         }
       }
 
-      // Curve for leg 1 (stablecoins → stablecoins via Curve, return via V2)
+      // Balancer V3 for leg 1
+      const balV3Out1 = await quoteBalancerV3(balV3Router, size, assetL, toLower(TARGET));
+      if (balV3Out1.out > 0n) {
+        const returnPath = [toLower(TARGET), assetL];
+        for (const v2B of v2Contracts) {
+          const out2 = await quoteV2(v2B.contract, balV3Out1.out, returnPath);
+          if (out2 > bestRoute.out2) {
+            bestRoute = { aName: "BalancerV3", bName: v2B.name, out1: balV3Out1.out, out2 };
+          }
+        }
+      }
+
+      // Curve stable for leg 1
       for (const curve of curveContracts) {
         const out1 = await quoteCurve(curve.contract, curve.coins, size, token.asset, TARGET);
         if (out1 <= 0n) continue;
@@ -313,12 +411,19 @@ async function main() {
     }
   }
 
-  console.log("=" .repeat(100));
+  console.log("=" .repeat(110));
+  const venueList = [
+    ...v2Contracts.map(v => v.name),
+    ...curveContracts.map(c => c.name),
+    ...curveCryptoContracts.map(c => c.name),
+    "BalancerV2",
+    "BalancerV3"
+  ];
   console.log(`\n\ud83d\udcca Summary: ${totalTests} quotes tested, ${profitableTests} profitable (\u2265 50 bps edge)`);
-  console.log(`\ud83d\udce1 Venues tested: ${v2Contracts.map(v => v.name).join(", ")}, ${curveContracts.map(c => c.name).join(", ")}`);
+  console.log(`\ud83d\udce1 Venues tested: ${venueList.join(", ")}`);
   console.log(`\ud83c\udfe6 Flash loan premium: ${premiumBps} bps`);
-  console.log(`\u2139\ufe0f  Balancer V3 not available on Polygon (V2 only)`);
-  console.log(`\u2139\ufe0f  Balancer V2 quoting: ${BALANCER_POOLS.length} pools loaded\n`);
+  console.log(`\u2139\ufe0f  Balancer V3 Router: ${BALANCER_V3_ROUTER}`);
+  console.log(`\u2139\ufe0f  Balancer pools loaded: ${BALANCER_POOLS.length} (V3: ${v3Pools.length})\n`);
 
   if (profitableTests > 0) {
     console.log("\ud83d\udfe2 Profitable opportunities found:");
@@ -326,7 +431,7 @@ async function main() {
       console.log(`   ${r.token} ${r.size} via ${r.legA}\u2192${r.legB}: edge ${r.edgeBps} bps, profit ${r.delta}`);
     }
   } else {
-    console.log("\ud83d\udd34 No profitable opportunities found at current prices (this is normal — arb is competitive).");
+    console.log("\ud83d\udd34 No profitable opportunities found at current prices (this is normal \u2014 arb is competitive).");
     console.log("   The bot monitors continuously and executes when opportunities arise.");
   }
 
