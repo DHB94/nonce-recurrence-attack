@@ -1,0 +1,19 @@
+{
+  "name": "flashbot-arb-polygon",
+  "version": "1.0.0",
+  "description": "All-in-one Polygon flash loan arbitrage bot (Aave V3 + QuickSwap/Sushi/Curve/Balancer)",
+  "main": "flashbot_arb_multi.js",
+  "scripts": {
+    "start": "node flashbot_arb_multi.js",
+    "check": "node --check flashbot_arb_multi.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.4",
+    "solc": "^0.8.28"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true
+}
