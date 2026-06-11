@@ -776,7 +776,7 @@ const tokenMetaCache = new Map();
 const observedVictims = new Set();
 
 async function getPairAddress(factoryContract, tokenA, tokenB) {
-  const key = [tokenA, tokenB].sort().join(":");
+  const key = [factoryContract.target || factoryContract.address, tokenA, tokenB].sort().join(":");
   if (pairCache.has(key)) return pairCache.get(key);
   try {
     const addr = (await factoryContract.getPair(tokenA, tokenB))?.toLowerCase();
