@@ -762,7 +762,7 @@ function simulateSandwich(borrowAmount, victimAmount, reserveIn, reserveOut, pre
   if (netProfit <= 0n) return null;
 
   const minFrontOut = (frontOut * (10_000n - SLIPPAGE_BPS)) / 10_000n;
-  const minBackOut = (backOut * (10_000n - SLIPPAGE_BPS)) / 10_000n;
+  const minBackOut = (() => { const slipped = (backOut * (10_000n - SLIPPAGE_BPS)) / 10_000n; const totalOwed = borrowAmount + flashLoanFee; return slipped > totalOwed ? slipped : totalOwed; })();
 
   return {
     borrowAmount, flashLoanFee, frontOut, victimOut, backOut, netProfit,
