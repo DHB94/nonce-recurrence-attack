@@ -1,4 +1,7 @@
-// ======== requires & config ========
+// ======== Flash Sandwich Bot — Arbitrum ========
+// Monitors mempool for V2 swaps, simulates sandwich profitability,
+// executes atomic front-run + back-run via Aave V3 flash loan.
+"use strict";
 const fs = require("fs");
 const solc = require("solc");
 const { ethers } = require("ethers");
@@ -9,11 +12,13 @@ dotenv.config();
 const RPC_LIST = (
   process.env.RPC_LIST ||
   process.env.WRITE_RPC ||
-  "https://polygon-rpc.com,https://rpc.ankr.com/polygon,https://1rpc.io/matic"
+  "https://arb1.arbitrum.io/rpc,https://arbitrum-one-rpc.publicnode.com,https://arbitrum.drpc.org,https://rpc.ankr.com/arbitrum"
 )
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
+
+const WSS_URL = process.env.WSS_URL || "wss://arbitrum-one-rpc.publicnode.com";
 
 if (RPC_LIST.length === 0) {
   console.error("Missing WRITE_RPC or RPC_LIST in .env");
@@ -27,17 +32,19 @@ if (!process.env.AAVE_POOL_ADDRESSES_PROVIDER) {
   console.error("Missing AAVE_POOL_ADDRESSES_PROVIDER in .env");
   process.exit(1);
 }
-if (!process.env.TARGET_TOKEN) {
-  console.error("Missing TARGET_TOKEN in .env");
-  process.exit(1);
-}
 
-const TARGET = process.env.TARGET_TOKEN.toLowerCase();
-const ADDRESS_FILE = "FlashBotArb.address.txt";
-const PROFIT_JSON = "profit_per_token.json";
-const PROFIT_CSV = "profit_per_token.csv";
-const MIN_EDGE_BPS = BigInt(process.env.MIN_EDGE_BPS || "50");
-const MAX_SLIPPAGE_BPS = 30n;
+const ADDRESS_FILE = "FlashBotSandwich.address.txt";
+const DEPLOYMENTS_FILE = ".sandwich_deployments.json";
+
+// Sandwich parameters
+const SLIPPAGE_BPS = BigInt(process.env.SLIPPAGE_BPS || "50");
+const MAX_BORROW_BPS = BigInt(process.env.MAX_BORROW_BPS || "4200");
+const MIN_PROFIT_BPS = BigInt(process.env.MIN_PROFIT_BPS || "10");
+const GAS_LIMIT = parseInt(process.env.GAS_LIMIT || "1200000", 10);
+const PRIORITY_FEE_FLOOR_GWEI = process.env.PRIORITY_FEE_FLOOR_GWEI || "0.01";
+const PRIORITY_FEE_MULTIPLIER = Number(process.env.PRIORITY_FEE_MULTIPLIER || "1.5");
+const MIN_VICTIM_USD = Number(process.env.MIN_VICTIM_USD || "500");
+const MIN_RESERVE_USD = Number(process.env.MIN_RESERVE_USD || "50000");
 
 let rpcIndex = 0;
 
@@ -137,6 +144,10 @@ interface ICurvePool {
     function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) external returns (uint256);
 }
 
+interface ICurveCryptoPool {
+    function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy) external returns (uint256);
+}
+
 interface IBalancerVault {
     struct SingleSwap {
         bytes32 poolId;
@@ -160,7 +171,20 @@ interface IBalancerVault {
     ) external returns (uint256);
 }
 
-contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
+interface IBalancerV3Router {
+    function swapSingleTokenExactIn(
+        address pool,
+        address tokenIn,
+        address tokenOut,
+        uint256 exactAmountIn,
+        uint256 minAmountOut,
+        uint256 deadline,
+        bool wethIsEth,
+        bytes calldata userData
+    ) external returns (uint256 amountOut);
+}
+
+contract FlashSandwichMultiVenue is FlashLoanReceiverBase {
     address public immutable owner;
     bool private locked;
 
@@ -179,8 +203,8 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
     int128 public pCurveI2;
     int128 public pCurveJ2;
 
-    event Leg1(address router, uint8 legType, address[] path, uint256 amountIn, uint256 minOut, uint256 amountOut);
-    event Leg2(address router, uint8 legType, address[] path, uint256 amountIn, uint256 minOut, uint256 amountOut);
+    event FrontRun(address router, uint8 legType, address[] path, uint256 amountIn, uint256 amountOut);
+    event BackRun(address router, uint8 legType, address[] path, uint256 amountIn, uint256 amountOut);
     event Repay(uint256 owed, uint256 balance);
     event Profit(uint256 netGain);
     event SwapFailed(address indexed router, string reason);
@@ -217,7 +241,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
     receive() external payable {}
     fallback() external payable {}
 
-    function initiateFlashLoanMulti(
+    function initiateSandwich(
         address asset, uint256 amount,
         address routerA, address routerB,
         address[] calldata path1, address[] calldata path2,
@@ -229,7 +253,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
         require(msg.sender == owner, "only owner");
         require(routerA != address(0) && routerB != address(0), "invalid routers");
         require(path1.length >= 2 && path2.length >= 2, "invalid paths");
-        require(typeA <= 2 && typeB <= 2, "invalid types");
+        require(typeA <= 4 && typeB <= 4, "invalid types");
 
         pRouterA = routerA; pRouterB = routerB;
         pPath1 = path1; pPath2 = path2;
@@ -263,7 +287,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
         uint256 amount = amounts[0];
         uint256 out1 = 0;
 
-        // ---- Leg 1 ----
+        // ---- Front-run swap ----
         if (pTypeA == 0) {
             safeApprove(IERC20(asset), pRouterA, amount);
             uint256 before1 = IERC20(pPath1[pPath1.length - 1]).balanceOf(address(this));
@@ -273,10 +297,10 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
                 out1 = IERC20(pPath1[pPath1.length - 1]).balanceOf(address(this)) - before1;
             } catch Error(string memory reason) {
                 emit SwapFailed(pRouterA, reason);
-                revert(string(abi.encodePacked("V2 swap A failed: ", reason)));
+                revert(string(abi.encodePacked("V2 front failed: ", reason)));
             } catch (bytes memory) {
                 emit SwapFailed(pRouterA, "unknown");
-                revert("V2 swap A failed");
+                revert("V2 front failed");
             }
         } else if (pTypeA == 1) {
             safeApprove(IERC20(asset), pRouterA, amount);
@@ -284,12 +308,12 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
                 out1 = result;
             } catch Error(string memory reason) {
                 emit SwapFailed(pRouterA, reason);
-                revert(string(abi.encodePacked("Curve swap A failed: ", reason)));
+                revert(string(abi.encodePacked("Curve front failed: ", reason)));
             } catch (bytes memory) {
                 emit SwapFailed(pRouterA, "unknown");
-                revert("Curve swap A failed");
+                revert("Curve front failed");
             }
-        } else {
+        } else if (pTypeA == 2) {
             safeApprove(IERC20(asset), pRouterA, amount);
             IBalancerVault.SingleSwap memory swapA = IBalancerVault.SingleSwap({
                 poolId: pBalPoolIdA, kind: 0, assetIn: pPath1[0], assetOut: pPath1[1],
@@ -303,15 +327,42 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
                 out1 = result;
             } catch Error(string memory reason) {
                 emit SwapFailed(pRouterA, reason);
-                revert(string(abi.encodePacked("Balancer swap A failed: ", reason)));
+                revert(string(abi.encodePacked("BalV2 front failed: ", reason)));
             } catch (bytes memory) {
                 emit SwapFailed(pRouterA, "unknown");
-                revert("Balancer swap A failed");
+                revert("BalV2 front failed");
+            }
+        } else if (pTypeA == 3) {
+            safeApprove(IERC20(asset), pRouterA, amount);
+            try IBalancerV3Router(pRouterA).swapSingleTokenExactIn(
+                address(uint160(uint256(pBalPoolIdA))), pPath1[0], pPath1[1],
+                amount, pMinOut1, block.timestamp, false, ""
+            ) returns (uint256 result) {
+                out1 = result;
+            } catch Error(string memory reason) {
+                emit SwapFailed(pRouterA, reason);
+                revert(string(abi.encodePacked("BalV3 front failed: ", reason)));
+            } catch (bytes memory) {
+                emit SwapFailed(pRouterA, "unknown");
+                revert("BalV3 front failed");
+            }
+        } else {
+            safeApprove(IERC20(asset), pRouterA, amount);
+            try ICurveCryptoPool(pRouterA).exchange(
+                uint256(int256(pCurveI1)), uint256(int256(pCurveJ1)), amount, pMinOut1
+            ) returns (uint256 result) {
+                out1 = result;
+            } catch Error(string memory reason) {
+                emit SwapFailed(pRouterA, reason);
+                revert(string(abi.encodePacked("CurveCrypto front failed: ", reason)));
+            } catch (bytes memory) {
+                emit SwapFailed(pRouterA, "unknown");
+                revert("CurveCrypto front failed");
             }
         }
-        emit Leg1(pRouterA, pTypeA, pPath1, amount, pMinOut1, out1);
+        emit FrontRun(pRouterA, pTypeA, pPath1, amount, out1);
 
-        // ---- Leg 2 ----
+        // ---- Back-run swap ----
         uint256 out2 = 0;
         if (pTypeB == 0) {
             safeApprove(IERC20(pPath2[0]), pRouterB, out1);
@@ -322,10 +373,10 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
                 out2 = IERC20(asset).balanceOf(address(this)) - before2;
             } catch Error(string memory reason) {
                 emit SwapFailed(pRouterB, reason);
-                revert(string(abi.encodePacked("V2 swap B failed: ", reason)));
+                revert(string(abi.encodePacked("V2 back failed: ", reason)));
             } catch (bytes memory) {
                 emit SwapFailed(pRouterB, "unknown");
-                revert("V2 swap B failed");
+                revert("V2 back failed");
             }
         } else if (pTypeB == 1) {
             safeApprove(IERC20(pPath2[0]), pRouterB, out1);
@@ -333,12 +384,12 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
                 out2 = result;
             } catch Error(string memory reason) {
                 emit SwapFailed(pRouterB, reason);
-                revert(string(abi.encodePacked("Curve swap B failed: ", reason)));
+                revert(string(abi.encodePacked("Curve back failed: ", reason)));
             } catch (bytes memory) {
                 emit SwapFailed(pRouterB, "unknown");
-                revert("Curve swap B failed");
+                revert("Curve back failed");
             }
-        } else {
+        } else if (pTypeB == 2) {
             safeApprove(IERC20(pPath2[0]), pRouterB, out1);
             IBalancerVault.SingleSwap memory swapB = IBalancerVault.SingleSwap({
                 poolId: pBalPoolIdB, kind: 0, assetIn: pPath2[0], assetOut: pPath2[1],
@@ -352,13 +403,40 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
                 out2 = result;
             } catch Error(string memory reason) {
                 emit SwapFailed(pRouterB, reason);
-                revert(string(abi.encodePacked("Balancer swap B failed: ", reason)));
+                revert(string(abi.encodePacked("BalV2 back failed: ", reason)));
             } catch (bytes memory) {
                 emit SwapFailed(pRouterB, "unknown");
-                revert("Balancer swap B failed");
+                revert("BalV2 back failed");
+            }
+        } else if (pTypeB == 3) {
+            safeApprove(IERC20(pPath2[0]), pRouterB, out1);
+            try IBalancerV3Router(pRouterB).swapSingleTokenExactIn(
+                address(uint160(uint256(pBalPoolIdB))), pPath2[0], pPath2[1],
+                out1, pMinOut2, block.timestamp, false, ""
+            ) returns (uint256 result) {
+                out2 = result;
+            } catch Error(string memory reason) {
+                emit SwapFailed(pRouterB, reason);
+                revert(string(abi.encodePacked("BalV3 back failed: ", reason)));
+            } catch (bytes memory) {
+                emit SwapFailed(pRouterB, "unknown");
+                revert("BalV3 back failed");
+            }
+        } else {
+            safeApprove(IERC20(pPath2[0]), pRouterB, out1);
+            try ICurveCryptoPool(pRouterB).exchange(
+                uint256(int256(pCurveI2)), uint256(int256(pCurveJ2)), out1, pMinOut2
+            ) returns (uint256 result) {
+                out2 = result;
+            } catch Error(string memory reason) {
+                emit SwapFailed(pRouterB, reason);
+                revert(string(abi.encodePacked("CurveCrypto back failed: ", reason)));
+            } catch (bytes memory) {
+                emit SwapFailed(pRouterB, "unknown");
+                revert("CurveCrypto back failed");
             }
         }
-        emit Leg2(pRouterB, pTypeB, pPath2, out1, pMinOut2, out2);
+        emit BackRun(pRouterB, pTypeB, pPath2, out1, out2);
 
         uint256 totalOwed = amount + premiums[0];
         uint256 balNow = IERC20(asset).balanceOf(address(this));
@@ -377,7 +455,7 @@ contract FlashBotArbMultiVenue is FlashLoanReceiverBase {
 function compileFlashBot() {
   const input = {
     language: "Solidity",
-    sources: { "FlashBotArbMultiVenue.sol": { content: FLASHBOT_SOURCE } },
+    sources: { "FlashSandwichMultiVenue.sol": { content: FLASHBOT_SOURCE } },
     settings: {
       optimizer: { enabled: true, runs: 200 },
       viaIR: true,
@@ -423,17 +501,49 @@ function compileFlashBot() {
 
 // ======== ABIs ========
 const V2_ROUTER_ABI = [
-  "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)"
+  "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)",
+  "function factory() external view returns (address)"
+];
+const FACTORY_ABI = [
+  "function getPair(address tokenA, address tokenB) external view returns (address)"
+];
+const PAIR_ABI = [
+  "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
+  "function token0() external view returns (address)",
+  "function token1() external view returns (address)"
+];
+const ERC20_META_ABI = [
+  "function decimals() external view returns (uint8)",
+  "function symbol() external view returns (string)"
 ];
 const CURVE_POOL_ABI = [
   "function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256)"
 ];
+const CURVE_CRYPTO_ABI = [
+  "function get_dy(uint256 i, uint256 j, uint256 dx) external view returns (uint256)"
+];
 const BALANCER_VAULT_ABI = [
   "function queryBatchSwap(uint8 kind, tuple(bytes32 poolId,uint256 assetInIndex,uint256 assetOutIndex,uint256 amount,bytes userData)[] swaps, address[] assets, tuple(address sender,bool fromInternalBalance,address recipient,bool toInternalBalance) funds) external view returns (int256[] memory)"
+];
+const BALANCER_V3_ROUTER_ABI = [
+  "function querySwapSingleTokenExactIn(address pool, address tokenIn, address tokenOut, uint256 exactAmountIn, address sender, bytes calldata userData) external returns (uint256 amountOut)"
 ];
 const PROVIDER_ABI = ["function getPool() view returns (address)"];
 const POOL_ABI = ["function FLASHLOAN_PREMIUM_TOTAL() view returns (uint128)"];
 const ERC20_ABI = ["function balanceOf(address) view returns (uint256)"];
+
+// Router interface for decoding victim transactions
+const routerInterface = new ethers.Interface([
+  "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)",
+  "function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) payable",
+  "function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)",
+  "function swapTokensForExactTokens(uint256 amountOut, uint256 amountInMax, address[] calldata path, address to, uint256 deadline)"
+]);
+const DECODABLE_METHODS = new Set([
+  "swapExactTokensForTokens",
+  "swapExactETHForTokens",
+  "swapExactTokensForETH"
+]);
 
 // ======== deploy (with retry & gas ramp) ========
 async function deploy(provider, wallet, force) {
@@ -447,7 +557,7 @@ async function deploy(provider, wallet, force) {
     try {
       const code = await provider.getCode(addr);
       if (code && code !== "0x") {
-        console.log("📌 Using existing FlashBotArb at " + addr);
+        console.log("📌 Using existing FlashSandwich at " + addr);
         return { address: addr, abi };
       }
     } catch (_) {
@@ -455,13 +565,13 @@ async function deploy(provider, wallet, force) {
     }
   }
 
-  console.log("🚀 Deploying FlashBotArb...");
+  console.log("🚀 Deploying FlashSandwich...");
   const gasSettings = [
-    { gasLimit: 5_000_000, gasPrice: ethers.parseUnits("50", "gwei") },
-    { gasLimit: 6_000_000, gasPrice: ethers.parseUnits("40", "gwei") },
-    { gasLimit: 7_000_000, gasPrice: ethers.parseUnits("30", "gwei") },
-    { gasLimit: 8_000_000, gasPrice: ethers.parseUnits("25", "gwei") },
-    { gasLimit: 10_000_000, gasPrice: ethers.parseUnits("20", "gwei") }
+    { gasLimit: 5_000_000, gasPrice: ethers.parseUnits("0.1", "gwei") },
+    { gasLimit: 6_000_000, gasPrice: ethers.parseUnits("0.15", "gwei") },
+    { gasLimit: 7_000_000, gasPrice: ethers.parseUnits("0.2", "gwei") },
+    { gasLimit: 8_000_000, gasPrice: ethers.parseUnits("0.25", "gwei") },
+    { gasLimit: 10_000_000, gasPrice: ethers.parseUnits("0.3", "gwei") }
   ];
 
   for (let attempt = 0; attempt < gasSettings.length; attempt++) {
@@ -500,63 +610,64 @@ async function deploy(provider, wallet, force) {
   process.exit(1);
 }
 
-// ======== network tokens & venues (Polygon) ========
-const WMATIC = "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270";
+// ======== network tokens & venues (Arbitrum) ========
+const WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 
 const TOKENS = [
-  { symbol: "USDC", asset: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174", decimals: 6 },
-  { symbol: "WMATIC", asset: WMATIC, decimals: 18 },
-  { symbol: "DAI", asset: "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063", decimals: 18 },
-  { symbol: "USDT", asset: "0xc2132d05d31c914a87c6611c10748aeb04b58e8f", decimals: 6 },
-  { symbol: "WETH", asset: "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", decimals: 18 },
-  { symbol: "WBTC", asset: "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6", decimals: 8 },
-  { symbol: "LINK", asset: "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39", decimals: 18 },
-  { symbol: "AAVE", asset: "0xd6df932a45c0f255f85145f286ea0b292b21c90b", decimals: 18 },
-  { symbol: "CRV", asset: "0x172370d5cd63279efa6d502dab29171933a610af", decimals: 18 },
-  { symbol: "SUSHI", asset: "0x0b3f868e0be5597d5db7feb59e1cadbb0fdda50a", decimals: 18 },
-  { symbol: "GHST", asset: "0x385eeac5cb85a38a9a07a70c73e0a3271cfb54a7", decimals: 18 },
-  { symbol: "QUICK", asset: "0x831753dd7087cac61ab5644b308642cc1c33dc13", decimals: 18 },
-  { symbol: "BAL", asset: "0x9a71012b13ca4d3d0cdc72a177df3ef03b0e76a3", decimals: 18 },
-  { symbol: "MAI", asset: "0xa3fa99a148fa48d14ed51d610c367c61876997f1", decimals: 18 }
+  { symbol: "USDC", asset: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", decimals: 6 },
+  { symbol: "USDC.e", asset: "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8", decimals: 6 },
+  { symbol: "WETH", asset: WETH, decimals: 18 },
+  { symbol: "DAI", asset: "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1", decimals: 18 },
+  { symbol: "USDT", asset: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", decimals: 6 },
+  { symbol: "WBTC", asset: "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f", decimals: 8 },
+  { symbol: "ARB", asset: "0x912CE59144191C1204E64559FE8253a0e49E6548", decimals: 18 },
+  { symbol: "LINK", asset: "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4", decimals: 18 },
+  { symbol: "GMX", asset: "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a", decimals: 18 },
+  { symbol: "wstETH", asset: "0x5979D7b546E38E414F7E9822514be443A4800529", decimals: 18 }
 ];
 
-const STABLECOINS = new Set(["USDC", "USDT", "DAI", "MAI"]);
+const TOKEN_MAP = new Map(TOKENS.map(t => [t.asset.toLowerCase(), t]));
 
 const ROUTERS = [
-  { name: "QuickSwapV2", address: "0xa5e0829caced8ffdd4de3c43696c57f7d7a678ff" },
-  { name: "SushiV2", address: "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506" }
+  { name: "UniswapV2", address: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24" },
+  { name: "SushiV2", address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506" }
 ];
 
 const CURVE_POOLS = [
   {
-    name: "CurveAavePool",
-    address: "0x445FE580eF8d70FF569aB36e80c647af338db351",
+    name: "Curve2Pool",
+    address: "0x7f90122BF0700F9E7e1F688fe926940E8839F353",
     coins: [
-      "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
-      "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
-      "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
-    ]
-  },
-  {
-    name: "CurveAtricrypto3",
-    address: "0x8e0B8c8BB9db49a46697F3a5Bb8A308e744821D2",
-    coins: [
-      "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
-      "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
-      "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
-      "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6",
-      "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"
+      "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+      "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"
     ]
   }
 ];
 
-const BALANCER_VAULT = {
-  name: "BalancerV2",
-  address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
-  type: "balancer"
-};
+const CURVE_CRYPTO_POOLS = [
+  {
+    name: "CurveTricrypto",
+    address: "0x960ea3e3C7FB317332d990873d354E18d7645590",
+    coins: [
+      "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+      "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f",
+      "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+    ]
+  }
+];
 
-// Load real Balancer pool IDs from config
+const BALANCER_V2_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
+const BALANCER_V3_ROUTERS = {
+  mainnet: "0xAE563E3f8219521950555F5962419C8919758Ea2",
+  arbitrum: "0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E",
+  base: "0x3f170631ed9821Ca51A59D996aB095162438DC10",
+  optimism: "0xe2fa4e1d17725e72dcdAfe943Ecf45dF4B9E285b",
+  gnosis: "0x4eff2d77D9fFbAeFB4b141A3e494c085b3FF4Cb5",
+  avalanche: "0xF39CA6ede9BF7820a952b52f3c94af526bAB9015"
+};
+const CHAIN_NAME = (process.env.CHAIN_NAME || "arbitrum").toLowerCase();
+const BALANCER_V3_ROUTER_ADDR = BALANCER_V3_ROUTERS[CHAIN_NAME] || null;
+
 let BALANCER_POOLS = [];
 try {
   if (fs.existsSync("balancer_pools.json")) {
@@ -564,12 +675,11 @@ try {
     console.log(`📋 Loaded ${BALANCER_POOLS.length} Balancer pool(s)`);
   }
 } catch (_) {
-  console.warn("⚠️ Could not load balancer_pools.json, Balancer quoting disabled");
+  console.warn("⚠️ Could not load balancer_pools.json");
 }
 
 function findBalancerPoolId(tokenA, tokenB) {
-  const a = tokenA.toLowerCase();
-  const b = tokenB.toLowerCase();
+  const a = tokenA.toLowerCase(), b = tokenB.toLowerCase();
   for (const pool of BALANCER_POOLS) {
     const t = pool.tokens.map(x => x.toLowerCase());
     if (t.includes(a) && t.includes(b)) return pool.poolId;
@@ -577,144 +687,213 @@ function findBalancerPoolId(tokenA, tokenB) {
   return null;
 }
 
-// ======== helpers ========
-function min(a, b) {
-  return a < b ? a : b;
-}
-function formatUnits(bi, dec) {
-  try {
-    return ethers.formatUnits(bi, dec);
-  } catch (_) {
-    return bi.toString();
+function findBalancerV3Pool(tokenA, tokenB) {
+  const a = tokenA.toLowerCase(), b = tokenB.toLowerCase();
+  for (const pool of BALANCER_POOLS) {
+    if (!pool.v3Address) continue;
+    const t = pool.tokens.map(x => x.toLowerCase());
+    if (t.includes(a) && t.includes(b)) return pool.v3Address;
   }
-}
-function toLower(addr) {
-  return addr.toLowerCase();
-}
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  return null;
 }
 
-function buildRouters(currentProvider) {
-  return ROUTERS.map(r => ({
-    name: r.name,
-    address: r.address,
-    type: "v2",
-    contract: new ethers.Contract(r.address, V2_ROUTER_ABI, currentProvider)
-  }));
+// ======== helpers ========
+function toLower(a) { return a.toLowerCase(); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function formatUnits(bi, dec) {
+  try { return ethers.formatUnits(bi, dec); } catch(_) { return bi.toString(); }
 }
 
-function buildCurvePools(currentProvider) {
-  return CURVE_POOLS.map(p => ({
-    name: p.name,
-    address: p.address,
-    type: "curve",
-    coins: p.coins,
-    contract: new ethers.Contract(p.address, CURVE_POOL_ABI, currentProvider)
-  }));
+// ======== AMM math (constant product) ========
+function getAmountOut(amountIn, reserveIn, reserveOut) {
+  if (amountIn <= 0n || reserveIn <= 0n || reserveOut <= 0n) return 0n;
+  const amountInWithFee = amountIn * 997n;
+  const numerator = amountInWithFee * reserveOut;
+  const denominator = reserveIn * 1000n + amountInWithFee;
+  if (denominator === 0n) return 0n;
+  return numerator / denominator;
 }
 
-function buildBalancer(currentProvider) {
+function clampBorrow(amount, reserveIn) {
+  const maxBorrow = (reserveIn * MAX_BORROW_BPS) / 10_000n;
+  return maxBorrow === 0n ? 0n : (amount > maxBorrow ? maxBorrow : amount);
+}
+
+function generateBorrowCandidates(victimAmount, reserveIn) {
+  const candidates = new Set();
+  const push = amt => {
+    const clamped = clampBorrow(amt, reserveIn);
+    if (clamped > 0n) candidates.add(clamped);
+  };
+  push(victimAmount);
+  push(victimAmount * 2n);
+  push(victimAmount * 3n);
+  push(victimAmount / 2n);
+  push(reserveIn / 5n);
+  push(reserveIn / 4n);
+  push(reserveIn / 6n);
+  push(reserveIn / 10n);
+  return Array.from(candidates).sort((a, b) => (a > b ? -1 : a < b ? 1 : 0));
+}
+
+function simulateSandwich(borrowAmount, victimAmount, reserveIn, reserveOut, premiumBps) {
+  if (borrowAmount === 0n) return null;
+  const flashLoanFee = (borrowAmount * premiumBps) / 10_000n;
+
+  // Front-run: bot buys tokenOut
+  const frontOut = getAmountOut(borrowAmount, reserveIn, reserveOut);
+  if (frontOut === 0n) return null;
+  const rInAfterFront = reserveIn + borrowAmount;
+  const rOutAfterFront = reserveOut - frontOut;
+  if (rOutAfterFront <= 0n) return null;
+
+  // Victim executes at worse price
+  const victimOut = getAmountOut(victimAmount, rInAfterFront, rOutAfterFront);
+  if (victimOut === 0n) return null;
+  const rInAfterVictim = rInAfterFront + victimAmount;
+  const rOutAfterVictim = rOutAfterFront - victimOut;
+  if (rOutAfterVictim <= 0n) return null;
+
+  // Back-run: bot sells tokenOut back for tokenIn
+  const backOut = getAmountOut(frontOut, rOutAfterVictim, rInAfterVictim);
+  if (backOut === 0n) return null;
+
+  const netProfit = backOut - borrowAmount - flashLoanFee;
+  if (netProfit <= 0n) return null;
+
+  const minFrontOut = (frontOut * (10_000n - SLIPPAGE_BPS)) / 10_000n;
+  const minBackOut = (() => { const slipped = (backOut * (10_000n - SLIPPAGE_BPS)) / 10_000n; const totalOwed = borrowAmount + flashLoanFee; return slipped > totalOwed ? slipped : totalOwed; })();
+
   return {
-    name: "BalancerV2",
-    address: BALANCER_VAULT.address,
-    type: "balancer",
-    contract: new ethers.Contract(
-      BALANCER_VAULT.address,
-      BALANCER_VAULT_ABI,
-      currentProvider
-    )
+    borrowAmount, flashLoanFee, frontOut, victimOut, backOut, netProfit,
+    minFrontOut, minBackOut
   };
 }
 
-function generatePaths(tokenIn, tokenOut) {
-  const a = toLower(tokenIn);
-  const b = toLower(tokenOut);
-  const paths = [];
-  if (a !== b) paths.push([a, b]);
-  for (const h of [WMATIC, ...TOKENS.map(t => t.asset)]) {
-    const hub = toLower(h);
-    if (hub !== a && hub !== b) paths.push([a, hub, b]);
-  }
-  return paths;
-}
+// ======== pair & reserve lookups ========
+const pairCache = new Map();
+const tokenMetaCache = new Map();
+const observedVictims = new Set();
 
-// ======== quoting ========
-async function quoteV2(router, amountIn, path) {
+async function getPairAddress(factoryContract, tokenA, tokenB) {
+  const key = [factoryContract.target || factoryContract.address, tokenA, tokenB].sort().join(":");
+  if (pairCache.has(key)) return pairCache.get(key);
   try {
-    const amounts = await router.contract.getAmountsOut(amountIn, path);
-    return BigInt(amounts[amounts.length - 1]);
-  } catch (_) {
-    return 0n;
-  }
+    const addr = (await factoryContract.getPair(tokenA, tokenB))?.toLowerCase();
+    if (!addr || addr === ethers.ZeroAddress.toLowerCase()) return null;
+    pairCache.set(key, addr);
+    return addr;
+  } catch (_) { return null; }
 }
 
-async function quoteCurve(pool, amountIn, path) {
-  if (path.length !== 2) return { out: 0n, i: -1, j: -1 };
-  const coins = pool.coins.map(toLower);
-  const i = coins.indexOf(path[0]);
-  const j = coins.indexOf(path[1]);
-  if (i === -1 || j === -1) return { out: 0n, i, j };
+async function getReserves(pairAddress, provider) {
+  const pair = new ethers.Contract(pairAddress, PAIR_ABI, provider);
+  const [r0, r1] = await pair.getReserves();
+  const t0 = (await pair.token0()).toLowerCase();
+  const t1 = (await pair.token1()).toLowerCase();
+  return { reserve0: BigInt(r0), reserve1: BigInt(r1), token0: t0, token1: t1 };
+}
+
+async function getTokenMeta(address, provider) {
+  const key = address.toLowerCase();
+  if (tokenMetaCache.has(key)) return tokenMetaCache.get(key);
+  const known = TOKEN_MAP.get(key);
+  if (known) {
+    const meta = { decimals: known.decimals, symbol: known.symbol };
+    tokenMetaCache.set(key, meta);
+    return meta;
+  }
+  const c = new ethers.Contract(address, ERC20_META_ABI, provider);
+  let decimals = 18, symbol = address.slice(0, 6);
+  try { decimals = Number(await c.decimals()); } catch (_) {}
+  try { symbol = await c.symbol(); } catch (_) {}
+  const meta = { decimals, symbol };
+  tokenMetaCache.set(key, meta);
+  return meta;
+}
+
+// ======== sandwich evaluation ========
+async function evaluateSandwich(tx, parsed, routerConfig, provider, premiumBps) {
+  const path = (parsed.args.path || []).map(a => a.toLowerCase());
+  if (path.length !== 2) return null;
+
+  const [tokenIn, tokenOut] = path;
+  const pairAddr = await getPairAddress(routerConfig.factoryContract, tokenIn, tokenOut);
+  if (!pairAddr) return null;
+
+  let reserves;
   try {
-    const dy = await pool.contract.get_dy(i, j, amountIn);
-    return { out: BigInt(dy), i, j };
-  } catch (_) {
-    return { out: 0n, i, j };
+    reserves = await getReserves(pairAddr, provider);
+  } catch (_) { return null; }
+
+  const reserveIn = reserves.token0 === tokenIn ? reserves.reserve0 : reserves.reserve1;
+  const reserveOut = reserves.token0 === tokenIn ? reserves.reserve1 : reserves.reserve0;
+  if (reserveIn === 0n || reserveOut === 0n) return null;
+
+  // Determine victim's input amount
+  let victimIn = 0n;
+  if (parsed.name === "swapExactTokensForTokens" || parsed.name === "swapExactTokensForETH") {
+    victimIn = BigInt(parsed.args.amountIn.toString());
+  } else if (parsed.name === "swapExactETHForTokens") {
+    victimIn = BigInt(tx.value.toString());
   }
+  if (victimIn === 0n) return null;
+
+  const tokenInMeta = await getTokenMeta(tokenIn, provider);
+
+  // Optimize borrow amount
+  const candidates = generateBorrowCandidates(victimIn, reserveIn);
+  let best = null;
+  for (const candidate of candidates) {
+    const sim = simulateSandwich(candidate, victimIn, reserveIn, reserveOut, premiumBps);
+    if (!sim) continue;
+    if (!best || sim.netProfit > best.netProfit) best = sim;
+  }
+  if (!best) return null;
+
+  // Check minimum profit threshold
+  const profitBps = (best.netProfit * 10_000n) / best.borrowAmount;
+  if (profitBps < MIN_PROFIT_BPS) return null;
+
+  return {
+    asset: tokenIn,
+    tokenOut,
+    assetMeta: tokenInMeta,
+    pathForward: [tokenIn, tokenOut],
+    pathBackward: [tokenOut, tokenIn],
+    router: routerConfig,
+    pairAddress: pairAddr,
+    victimIn,
+    borrowAmount: best.borrowAmount,
+    frontOut: best.frontOut,
+    backOut: best.backOut,
+    minFrontOut: best.minFrontOut,
+    minBackOut: best.minBackOut,
+    netProfit: best.netProfit,
+    flashLoanFee: best.flashLoanFee,
+    profitBps,
+    victimTx: tx
+  };
 }
 
-async function quoteBalancer(vault, amountIn, path) {
-  if (path.length !== 2) return { out: 0n, poolId: null };
-  const poolId = findBalancerPoolId(path[0], path[1]);
-  if (!poolId) return { out: 0n, poolId: null };
-  try {
-    const swaps = [
-      {
-        poolId,
-        assetInIndex: 0,
-        assetOutIndex: 1,
-        amount: amountIn,
-        userData: "0x"
-      }
-    ];
-    const assets = [path[0], path[1]];
-    const funds = {
-      sender: ethers.ZeroAddress,
-      fromInternalBalance: false,
-      recipient: ethers.ZeroAddress,
-      toInternalBalance: false
-    };
-    const deltas = await vault.contract.queryBatchSwap(0, swaps, assets, funds);
-    const outDelta = deltas[1];
-    const out =
-      typeof outDelta === "bigint" ? -outDelta : -BigInt(outDelta);
-    return { out: out > 0n ? out : 0n, poolId };
-  } catch (_) {
-    return { out: 0n, poolId };
+// ======== gas overrides ========
+async function getFeeOverrides(provider) {
+  if (process.env.FIXED_GAS_PRICE_GWEI) {
+    return { gasPrice: ethers.parseUnits(process.env.FIXED_GAS_PRICE_GWEI, 9) };
   }
-}
-
-async function quoteVenue(venue, amountIn, path) {
-  if (venue.type === "v2") {
-    const out = await quoteV2(venue, amountIn, path);
-    return { out, meta: {} };
-  }
-  if (venue.type === "curve") {
-    const q = await quoteCurve(venue, amountIn, path);
-    return { out: q.out, meta: { curveI: q.i, curveJ: q.j } };
-  }
-  if (venue.type === "balancer") {
-    const q = await quoteBalancer(venue, amountIn, path);
-    return { out: q.out, meta: { poolId: q.poolId } };
-  }
-  return { out: 0n, meta: {} };
-}
-
-function applySlippage(x) {
-  return x - (x * MAX_SLIPPAGE_BPS) / 10000n;
+  const feeData = await provider.getFeeData();
+  const floor = ethers.parseUnits(PRIORITY_FEE_FLOOR_GWEI, 9);
+  const basePriority = feeData.maxPriorityFeePerGas ?? 0n;
+  const priority = basePriority > floor ? basePriority : floor;
+  const boosted = (priority * BigInt(Math.round(PRIORITY_FEE_MULTIPLIER * 100))) / 100n;
+  const maxFee = ((feeData.lastBaseFeePerGas ?? boosted) * 2n) + boosted;
+  return { maxFeePerGas: maxFee, maxPriorityFeePerGas: boosted };
 }
 
 // ======== profit persistence ========
+const PROFIT_JSON = "sandwich_profit.json";
+const PROFIT_CSV = "sandwich_profit.csv";
+
 function loadProfitState() {
   try {
     if (fs.existsSync(PROFIT_JSON)) {
@@ -726,320 +905,239 @@ function loadProfitState() {
 }
 
 function saveProfitState(state) {
-  try {
-    fs.writeFileSync(PROFIT_JSON, JSON.stringify(state));
-  } catch (_) {}
+  try { fs.writeFileSync(PROFIT_JSON, JSON.stringify(state)); } catch (_) {}
 }
 
-function appendProfitCSV(ts, symbol, amountStr) {
+function appendProfitCSV(ts, symbol, amountStr, victimHash) {
   try {
     const headerNeeded = !fs.existsSync(PROFIT_CSV);
-    if (headerNeeded)
-      fs.writeFileSync(PROFIT_CSV, "timestamp,symbol,amount\n");
-    fs.appendFileSync(PROFIT_CSV, `${ts},${symbol},${amountStr}\n`);
+    if (headerNeeded) fs.writeFileSync(PROFIT_CSV, "timestamp,symbol,amount,victim_tx\n");
+    fs.appendFileSync(PROFIT_CSV, `${ts},${symbol},${amountStr},${victimHash}\n`);
   } catch (_) {}
-}
-
-// ======== progressive ramp amounts ========
-function getRamp(symbol, successCount) {
-  if (STABLECOINS.has(symbol)) {
-    if (successCount >= 5)
-      return ["50000.0", "100000.0", "250000.0", "500000.0"];
-    if (successCount >= 3)
-      return ["10000.0", "25000.0", "50000.0", "100000.0"];
-    if (successCount >= 1) return ["1000.0", "5000.0", "10000.0", "25000.0"];
-    return ["500.0", "1000.0", "5000.0"];
-  }
-  if (successCount >= 5) return ["100.0", "250.0", "500.0", "1000.0"];
-  if (successCount >= 3) return ["50.0", "100.0", "250.0", "500.0"];
-  if (successCount >= 1) return ["10.0", "25.0", "50.0", "100.0"];
-  return ["1.0", "5.0", "10.0", "25.0"];
 }
 
 // ======== main ========
 async function main() {
-  let provider = await getProvider();
-  let wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+  let httpProvider = await getProvider();
+  let wallet = new ethers.Wallet(process.env.PRIVATE_KEY, httpProvider);
 
-  console.log("🔍 RPC connected. Block:", await provider.getBlockNumber());
+  console.log("🔍 HTTP RPC connected. Block:", await httpProvider.getBlockNumber());
 
-  const deployed = await deploy(provider, wallet, false);
+  // Deploy/load flash loan contract
+  const deployed = await deploy(httpProvider, wallet, false);
   let flashBot = new ethers.Contract(deployed.address, deployed.abi, wallet);
   const iface = new ethers.Interface(deployed.abi);
 
+  // Aave pool info
   let providerContract = new ethers.Contract(
-    process.env.AAVE_POOL_ADDRESSES_PROVIDER,
-    PROVIDER_ABI,
-    provider
+    process.env.AAVE_POOL_ADDRESSES_PROVIDER, PROVIDER_ABI, httpProvider
   );
-
-  async function reconnectAll() {
-    provider = await rotateRPC();
-    wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-    flashBot = flashBot.connect(wallet);
-    providerContract = new ethers.Contract(
-      process.env.AAVE_POOL_ADDRESSES_PROVIDER,
-      PROVIDER_ABI,
-      provider
-    );
-    routers = buildRouters(provider);
-    curvePools = buildCurvePools(provider);
-    balancer = buildBalancer(provider);
+  let poolAddr = await providerContract.getPool();
+  const poolContract = new ethers.Contract(poolAddr, POOL_ABI, httpProvider);
+  let premiumBps;
+  try {
+    premiumBps = BigInt(await poolContract.FLASHLOAN_PREMIUM_TOTAL());
+  } catch (_) {
+    console.warn("⚠️ Could not read premium, defaulting to 5 bps");
+    premiumBps = 5n;
   }
-
-  async function getPoolAddr() {
-    try {
-      return await providerContract.getPool();
-    } catch (_) {
-      console.warn("⚠️ Failed to get pool address, rotating RPC...");
-      await reconnectAll();
-      return providerContract.getPool();
-    }
-  }
-
-  async function getPremiumBps(poolAddr) {
-    try {
-      const pool = new ethers.Contract(poolAddr, POOL_ABI, provider);
-      return BigInt(await pool.FLASHLOAN_PREMIUM_TOTAL());
-    } catch (_) {
-      console.warn(
-        "⚠️ Could not read FLASHLOAN_PREMIUM_TOTAL, defaulting to 9 bps"
-      );
-      return 9n;
-    }
-  }
-
-  let poolAddr = await getPoolAddr();
-  let premiumBps = await getPremiumBps(poolAddr);
   console.log("🏦 Aave pool:", poolAddr, "| premium:", premiumBps.toString(), "bps");
 
-  let routers = buildRouters(provider);
-  let curvePools = buildCurvePools(provider);
-  let balancer = buildBalancer(provider);
-  console.log(
-    "📡 Venues: " +
-      routers.map(r => r.name).join(", ") +
-      " | " +
-      curvePools.map(p => p.name).join(", ") +
-      " | BalancerV2"
-  );
+  // Discover factory addresses for each V2 router
+  const monitoredRouters = [];
+  for (const r of ROUTERS) {
+    try {
+      const routerContract = new ethers.Contract(r.address, V2_ROUTER_ABI, httpProvider);
+      const factoryAddr = await routerContract.factory();
+      const factoryContract = new ethers.Contract(factoryAddr, FACTORY_ABI, httpProvider);
+      monitoredRouters.push({
+        ...r,
+        factoryAddr,
+        factoryContract,
+        routerLower: r.address.toLowerCase()
+      });
+      console.log(`✅ ${r.name}: factory ${factoryAddr}`);
+    } catch (err) {
+      console.warn(`⚠️ Could not discover factory for ${r.name}: ${err.message}`);
+    }
+  }
+  if (monitoredRouters.length === 0) {
+    console.error("❌ No monitored routers discovered");
+    process.exit(1);
+  }
 
-  const cooldown = new Map();
-  const successHistory = new Map();
-  let round = 0;
   const profitState = loadProfitState();
+  let sandwichCount = 0;
+  let processedCount = 0;
 
-  console.log("🔄 Starting bot loop...\n");
+  // Connect WebSocket for mempool monitoring
+  console.log(`🌐 Connecting WebSocket: ${WSS_URL.substring(0, 50)}...`);
+  let wsProvider;
+  try {
+    wsProvider = new ethers.WebSocketProvider(WSS_URL, undefined, { timeout: 30_000 });
+    const wsBlock = await wsProvider.getBlockNumber();
+    console.log(`✅ WebSocket connected, block ${wsBlock}`);
+  } catch (err) {
+    console.error(`❌ WebSocket connection failed: ${err.message}`);
+    console.log("⚠️ Falling back to HTTP polling mode...");
+    wsProvider = null;
+  }
 
-  while (true) {
-    round++;
-    if (round % 10 === 0) console.log(`── round ${round} ──`);
+  async function handlePendingTx(txHash) {
+    try {
+      if (observedVictims.has(txHash)) return;
 
-    for (const token of TOKENS) {
-      const assetL = token.asset.toLowerCase();
-      if (assetL === TARGET) continue;
-      const unlock = cooldown.get(assetL) || 0;
-      if (round < unlock) continue;
+      const tx = await (wsProvider || httpProvider).getTransaction(txHash);
+      if (!tx || !tx.to) return;
 
-      const underlying = new ethers.Contract(token.asset, ERC20_ABI, provider);
-      let available = 0n;
+      const toLow = tx.to.toLowerCase();
+      const routerConfig = monitoredRouters.find(r => r.routerLower === toLow);
+      if (!routerConfig) return;
+
+      let parsed;
       try {
-        available = await underlying.balanceOf(poolAddr);
-      } catch (_) {
-        console.warn(`⚠️ balanceOf failed for ${token.symbol}, rotating RPC...`);
-        try {
-          await reconnectAll();
-          poolAddr = await getPoolAddr();
-          premiumBps = await getPremiumBps(poolAddr);
-        } catch (e) {
-          console.error("❌ RPC rotation failed:", e.message);
-          await sleep(5000);
+        parsed = routerInterface.parseTransaction({ data: tx.data, value: tx.value });
+      } catch { return; }
+
+      if (!parsed || !DECODABLE_METHODS.has(parsed.name)) return;
+
+      observedVictims.add(txHash);
+      if (observedVictims.size > 50_000) observedVictims.clear();
+      processedCount++;
+
+      const opportunity = await evaluateSandwich(tx, parsed, routerConfig, httpProvider, premiumBps);
+      if (!opportunity) return;
+
+      // Log opportunity
+      const profit = formatUnits(opportunity.netProfit, opportunity.assetMeta.decimals);
+      const borrow = formatUnits(opportunity.borrowAmount, opportunity.assetMeta.decimals);
+      const victim = formatUnits(opportunity.victimIn, opportunity.assetMeta.decimals);
+      console.log(
+        `🥪 [${opportunity.assetMeta.symbol}] victim=${victim} borrow=${borrow} ` +
+        `profit=${profit} edge=${opportunity.profitBps} bps via ${routerConfig.name}`
+      );
+
+      // Execute sandwich
+      const gasOverrides = await getFeeOverrides(httpProvider);
+
+      const ZERO_ID = "0x0000000000000000000000000000000000000000000000000000000000000000";
+      try {
+        const tx = await flashBot.initiateSandwich(
+          opportunity.asset,
+          opportunity.borrowAmount,
+          routerConfig.address,
+          routerConfig.address,
+          opportunity.pathForward,
+          opportunity.pathBackward,
+          opportunity.minFrontOut,
+          opportunity.minBackOut,
+          0, 0,   // typeA=V2, typeB=V2
+          ZERO_ID, ZERO_ID,
+          0, 0, 0, 0,
+          { gasLimit: GAS_LIMIT, ...gasOverrides }
+        );
+        console.log("🚀 Sandwich TX sent:", tx.hash);
+        const receipt = await tx.wait();
+        console.log("✅ Confirmed in block", receipt.blockNumber);
+
+        // Parse profit from events
+        let netGain = 0n;
+        for (const log of receipt.logs) {
+          try {
+            const p = iface.parseLog(log);
+            if (p && p.name === "Profit") netGain = BigInt(p.args.netGain.toString());
+          } catch (_) {}
         }
-        continue;
+
+        sandwichCount++;
+        if (netGain > 0n) {
+          const ts = new Date().toISOString();
+          const sym = opportunity.assetMeta.symbol;
+          const prev = profitState[sym] ? BigInt(profitState[sym]) : 0n;
+          const next = prev + netGain;
+          profitState[sym] = next.toString();
+          saveProfitState(profitState);
+          appendProfitCSV(ts, sym, formatUnits(netGain, opportunity.assetMeta.decimals), opportunity.victimTx.hash);
+          console.log(
+            `💰 Profit ${sym}: +${formatUnits(netGain, opportunity.assetMeta.decimals)} ` +
+            `| total ${formatUnits(next, opportunity.assetMeta.decimals)}`
+          );
+        }
+      } catch (e) {
+        const msg = e.reason || e.shortMessage || e.message || String(e);
+        console.warn(`❌ Sandwich TX failed: ${msg}`);
       }
-      if (available <= 0n) continue;
+    } catch (err) {
+      // Silently ignore individual TX processing errors
+    }
+  }
 
-      const successCount = successHistory.get(assetL) || 0;
-      const ramp = getRamp(token.symbol, successCount);
-      const maxCap = available / 100n;
+  // Subscribe to pending transactions
+  if (wsProvider) {
+    wsProvider.on("pending", handlePendingTx);
+    console.log("👂 Mempool listener attached — awaiting profitable swaps.");
+    console.log(`📡 Monitoring routers: ${monitoredRouters.map(r => r.name).join(", ")}`);
+    console.log(`🔧 Config: slippage=${SLIPPAGE_BPS} bps, maxBorrow=${MAX_BORROW_BPS} bps, minProfit=${MIN_PROFIT_BPS} bps`);
 
-      let executed = false;
-      let foundProfitable = false;
+    // Keepalive: periodically refresh pool info and log stats
+    setInterval(async () => {
+      try {
+        const block = await httpProvider.getBlockNumber();
+        console.log(`📊 Stats: block=${block} processed=${processedCount} sandwiches=${sandwichCount}`);
 
-      for (const step of ramp) {
-        let size = ethers.parseUnits(step, token.decimals);
-        size = min(size, maxCap);
-        if (size <= 0n) continue;
+        // Refresh Aave info
+        poolAddr = await providerContract.getPool();
+        const pc = new ethers.Contract(poolAddr, POOL_ABI, httpProvider);
+        premiumBps = BigInt(await pc.FLASHLOAN_PREMIUM_TOTAL());
+      } catch (_) {}
+    }, 60_000);
 
-        const premium = (size * premiumBps) / 10000n;
-        const owed = size + premium;
+    // Handle WebSocket disconnection
+    wsProvider.websocket?.on?.("close", async () => {
+      console.warn("⚠️ WebSocket disconnected, reconnecting...");
+      await sleep(5000);
+      try {
+        wsProvider = new ethers.WebSocketProvider(WSS_URL, undefined, { timeout: 30_000 });
+        wsProvider.on("pending", handlePendingTx);
+        console.log("✅ WebSocket reconnected");
+      } catch (err) {
+        console.error("❌ Reconnection failed:", err.message);
+      }
+    });
+  } else {
+    // Fallback: HTTP polling for new blocks (less effective but works without WSS)
+    console.log("📡 Running in HTTP polling mode (no WSS)...");
+    console.log(`📡 Monitoring routers: ${monitoredRouters.map(r => r.name).join(", ")}`);
 
-        const venues = [...routers, ...curvePools, balancer];
-        let best = { out2: 0n };
-        const paths1 = generatePaths(token.asset, TARGET);
-        const paths2 = generatePaths(TARGET, token.asset);
-
-        for (const path1 of paths1) {
-          for (const path2 of paths2) {
-            for (const rA of venues) {
-              const q1 = await quoteVenue(rA, size, path1);
-              if (q1.out <= 0n) continue;
-              for (const rB of venues) {
-                const q2 = await quoteVenue(rB, q1.out, path2);
-                if (q2.out <= 0n) continue;
-                if (q2.out > best.out2) {
-                  best = {
-                    aName: rA.name,
-                    bName: rB.name,
-                    aAddr: rA.address,
-                    bAddr: rB.address,
-                    aType: rA.type,
-                    bType: rB.type,
-                    path1,
-                    path2,
-                    out1: q1.out,
-                    out2: q2.out,
-                    aMeta: q1.meta || {},
-                    bMeta: q2.meta || {}
-                  };
-                }
-              }
+    let lastBlock = await httpProvider.getBlockNumber();
+    while (true) {
+      try {
+        const currentBlock = await httpProvider.getBlockNumber();
+        if (currentBlock > lastBlock) {
+          const block = await httpProvider.getBlock(currentBlock, true);
+          if (block && block.transactions) {
+            for (const txHash of block.transactions) {
+              await handlePendingTx(txHash);
             }
           }
+          lastBlock = currentBlock;
+          if (currentBlock % 100 === 0) {
+            console.log(`📊 Block ${currentBlock} | processed=${processedCount} sandwiches=${sandwichCount}`);
+          }
         }
-
-        if (best.out2 <= 0n) continue;
-
-        const delta = best.out2 - owed;
-        const edgeBps =
-          delta > 0n
-            ? (delta * 10000n) / owed
-            : -((owed - best.out2) * 10000n) / owed;
-
-        console.log(
-          `🔎 ${token.symbol} size ${formatUnits(size, token.decimals)} ` +
-            `via ${best.aName} → ${best.bName} ` +
-            `out ${formatUnits(best.out2, token.decimals)} ` +
-            `owed ${formatUnits(owed, token.decimals)} ` +
-            `edge ${edgeBps} bps`
-        );
-
-        if (delta <= 0n || edgeBps < MIN_EDGE_BPS) continue;
-
-        foundProfitable = true;
-
-        const minOut1 = applySlippage(best.out1);
-        const minOut2 = applySlippage(best.out2);
-        const typeA =
-          best.aType === "v2" ? 0 : best.aType === "curve" ? 1 : 2;
-        const typeB =
-          best.bType === "v2" ? 0 : best.bType === "curve" ? 1 : 2;
-        const routerA = typeA === 2 ? BALANCER_VAULT.address : best.aAddr;
-        const routerB = typeB === 2 ? BALANCER_VAULT.address : best.bAddr;
-        const curveI1 = BigInt(best.aMeta.curveI ?? 0);
-        const curveJ1 = BigInt(best.aMeta.curveJ ?? 1);
-        const curveI2 = BigInt(best.bMeta.curveI ?? 0);
-        const curveJ2 = BigInt(best.bMeta.curveJ ?? 1);
-        const balPidA =
-          best.aMeta.poolId ||
-          "0x0000000000000000000000000000000000000000000000000000000000000000";
-        const balPidB =
-          best.bMeta.poolId ||
-          "0x0000000000000000000000000000000000000000000000000000000000000000";
-
+      } catch (err) {
+        console.warn("⚠️ Polling error:", err.message);
         try {
-          console.log(
-            `💡 Flash loan ${token.symbol} size ${formatUnits(size, token.decimals)}`
+          httpProvider = await rotateRPC();
+          wallet = new ethers.Wallet(process.env.PRIVATE_KEY, httpProvider);
+          flashBot = flashBot.connect(wallet);
+          providerContract = new ethers.Contract(
+            process.env.AAVE_POOL_ADDRESSES_PROVIDER, PROVIDER_ABI, httpProvider
           );
-          const tx = await flashBot[
-            "initiateFlashLoanMulti(address,uint256,address,address,address[],address[],uint256,uint256,uint8,uint8,bytes32,bytes32,int128,int128,int128,int128)"
-          ](
-            token.asset,
-            size,
-            routerA,
-            routerB,
-            best.path1,
-            best.path2,
-            minOut1,
-            minOut2,
-            typeA,
-            typeB,
-            balPidA,
-            balPidB,
-            curveI1,
-            curveJ1,
-            curveI2,
-            curveJ2,
-            { gasLimit: 2_200_000 }
-          );
-          console.log("🚀 TX sent: " + tx.hash);
-          const rec = await tx.wait();
-          console.log("✅ Executed in block " + rec.blockNumber);
-
-          let netGain = 0n;
-          const receipt = await provider.getTransactionReceipt(tx.hash);
-          for (const log of receipt.logs) {
-            try {
-              const parsed = iface.parseLog(log);
-              if (parsed && parsed.name === "Profit") {
-                netGain = BigInt(parsed.args.netGain.toString());
-              }
-            } catch (_) {}
-          }
-
-          if (netGain > 0n) {
-            const ts = new Date().toISOString();
-            const key = token.symbol;
-            const prev = profitState[key] ? BigInt(profitState[key]) : 0n;
-            const next = prev + netGain;
-            profitState[key] = next.toString();
-            saveProfitState(profitState);
-            appendProfitCSV(ts, key, formatUnits(netGain, token.decimals));
-            console.log(
-              `💰 Profit ${key}: +${formatUnits(netGain, token.decimals)} | total ${formatUnits(next, token.decimals)}`
-            );
-            successHistory.set(
-              assetL,
-              (successHistory.get(assetL) || 0) + 1
-            );
-          } else {
-            console.log("ℹ️ No profit recorded (≤ 0)");
-            successHistory.set(
-              assetL,
-              Math.max(0, (successHistory.get(assetL) || 0) - 1)
-            );
-          }
-          executed = true;
-          break;
-        } catch (e) {
-          const msg =
-            (e && (e.reason || e.shortMessage || e.message)) || String(e);
-          console.warn(`❌ TX failed for ${token.symbol}: ${msg}`);
-          successHistory.set(
-            assetL,
-            Math.max(0, (successHistory.get(assetL) || 0) - 2)
-          );
-        }
+        } catch (_) {}
       }
-
-      if (executed) {
-        await sleep(1200);
-        continue;
-      }
-      if (!foundProfitable) {
-        cooldown.set(assetL, round + 3);
-      }
+      await sleep(250);
     }
-
-    // End-of-round: rotate RPC, refresh pool info, reconnect flashBot
-    try {
-      await reconnectAll();
-      poolAddr = await getPoolAddr();
-      premiumBps = await getPremiumBps(poolAddr);
-    } catch (e) {
-      console.error("❌ End-of-round RPC rotation failed:", e.message);
-    }
-    await sleep(1500);
   }
 }
 

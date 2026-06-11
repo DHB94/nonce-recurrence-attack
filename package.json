@@ -1,7 +1,7 @@
 {
-  "name": "flashbot-arb-polygon",
+  "name": "flash-sandwich-arbitrum",
   "version": "1.0.0",
-  "description": "All-in-one Polygon flash loan arbitrage bot (Aave V3 + QuickSwap/Sushi/Curve/Balancer)",
+  "description": "Arbitrum flash loan sandwich bot (Aave V3 + UniswapV2/Sushi/Curve/Balancer mempool monitoring)",
   "main": "flashbot_arb_multi.js",
   "scripts": {
     "start": "node flashbot_arb_multi.js",
