@@ -5,7 +5,9 @@
   "main": "flashbot_arb_multi.js",
   "scripts": {
     "start": "node flashbot_arb_multi.js",
-    "check": "node --check flashbot_arb_multi.js"
+    "check": "node --check flashbot_arb_multi.js && node --check polygon_flash_sandwich_bot.js",
+    "test": "npm run test:polygon",
+    "test:polygon": "node test_polygon_flash_sandwich_bot.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

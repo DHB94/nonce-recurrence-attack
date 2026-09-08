@@ -1,55 +1,122 @@
 "use strict";
 
+/**
+ * Polygon QuickSwap mempool scanner and bundle executor.
+ *
+ * Important: a Balancer flash loan cannot span three separate transactions.
+ * The old version borrowed, swapped twice, and expected a victim transaction to
+ * execute between those swaps. Everything happened in one EVM transaction, so
+ * it was an atomic two-leg swap rather than a sandwich. This version uses an
+ * owner-funded executor and submits [front-run, victim, back-run] as a private
+ * bundle. It never sends a public sandwich transaction.
+ *
+ * The default mode is "scan". Set MODE=execute only after configuring an
+ * executor contract, execution capital, and a relay that accepts raw
+ * Polygon bundles. The relay API is intentionally kept to the standard
+ * eth_sendBundle JSON-RPC method; relay-specific authentication is optional.
+ */
+
 const fs = require("fs");
 const path = require("path");
 const { ethers } = require("ethers");
 const solc = require("solc");
 require("dotenv").config();
 
+const ZERO_ADDRESS = ethers.ZeroAddress;
 const DEFAULT_WSS = "wss://polygon.llamarpc.com";
-const DEFAULT_BALANCER_VAULT = process.env.BALANCER_VAULT_ADDRESS || "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
-const QUICKSWAP_ROUTER = (process.env.QUICKSWAP_ROUTER || "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff").toLowerCase();
-const QUICKSWAP_FACTORY = (process.env.QUICKSWAP_FACTORY || "0x5757371414417b8c6caad45baef941abc7d3ab32").toLowerCase();
-const RPC_URL = process.env.POLYGON_WS_URL || process.env.POLYGON_RPC_URL || DEFAULT_WSS;
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-
-if (!PRIVATE_KEY) throw new Error("Missing PRIVATE_KEY in environment");
-if (!RPC_URL || !RPC_URL.startsWith("ws")) {
-  throw new Error("Pending transaction stream requires a Polygon websocket endpoint in POLYGON_WS_URL/POLYGON_RPC_URL");
-}
-if (!DEFAULT_BALANCER_VAULT) {
-  throw new Error("BALANCER_VAULT_ADDRESS must be provided for flash-loan execution");
-}
-
-const FLASH_LOAN_AMOUNT = process.env.FLASH_LOAN_AMOUNT || "12"; // units in asset decimals
-const MIN_PROFIT_AMOUNT = process.env.MIN_PROFIT_AMOUNT || "0.35";
-const MIN_POOL_BASE = process.env.MIN_POOL_BASE || "15";
-const BALANCER_FEE_BPS = BigInt(process.env.BALANCER_FLASH_LOAN_FEE_BPS || "9");
-const SLIPPAGE_BPS = BigInt(process.env.SLIPPAGE_BPS || "35");
-const MAX_BORROW_BPS = BigInt(process.env.MAX_BORROW_BPS || "4200");
-const GAS_LIMIT = parseInt(process.env.GAS_LIMIT || "520000", 10);
-const PRIORITY_FEE_FLOOR_GWEI = process.env.PRIORITY_FEE_FLOOR_GWEI || "60";
-const PRIORITY_FEE_MULTIPLIER = Number(process.env.PRIORITY_FEE_MULTIPLIER || "2.5");
+const DEFAULT_ROUTER = "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff";
+const DEFAULT_FACTORY = "0x5757371414417b8c6caad45baef941abc7d3ab32";
+const POLYGON_MAINNET_CHAIN_ID = 137n;
 const DEPLOYMENTS_FILE = path.join(__dirname, ".polygon_sandwich_deployments.json");
 
-if (BALANCER_FEE_BPS < 0n || BALANCER_FEE_BPS > 10_000n) {
-  throw new Error("BALANCER_FLASH_LOAN_FEE_BPS must be between 0 and 10000");
-}
-if (SLIPPAGE_BPS < 0n || SLIPPAGE_BPS >= 10_000n) {
-  throw new Error("SLIPPAGE_BPS must be between 0 and 9999");
-}
-if (MAX_BORROW_BPS <= 0n || MAX_BORROW_BPS >= 10_000n) {
-  throw new Error("MAX_BORROW_BPS must be between 1 and 9999");
-}
-if (!Number.isFinite(PRIORITY_FEE_MULTIPLIER) || PRIORITY_FEE_MULTIPLIER <= 0) {
-  throw new Error("PRIORITY_FEE_MULTIPLIER must be a positive number");
-}
-if (!Number.isFinite(GAS_LIMIT) || GAS_LIMIT <= 0) {
-  throw new Error("GAS_LIMIT must be a positive integer");
+function readEnv(name, fallback) {
+  const value = process.env[name];
+  return value === undefined || value === "" ? fallback : value;
 }
 
-const provider = new ethers.WebSocketProvider(RPC_URL, undefined, { timeout: 30_000 });
-const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+function parseBoolean(name, fallback = false) {
+  const value = String(readEnv(name, fallback ? "true" : "false")).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(value)) return true;
+  if (["0", "false", "no", "n", "off"].includes(value)) return false;
+  throw new Error(`${name} must be true or false`);
+}
+
+function parseBigIntEnv(name, fallback) {
+  const value = readEnv(name, fallback);
+  try {
+    return BigInt(value);
+  } catch (error) {
+    throw new Error(`${name} must be an integer: ${error.message}`);
+  }
+}
+
+function parsePositiveNumberEnv(name, fallback) {
+  const value = Number(readEnv(name, fallback));
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a positive number`);
+  }
+  return value;
+}
+
+function parsePositiveIntegerEnv(name, fallback) {
+  const value = Number(readEnv(name, fallback));
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function addressFromEnv(name, fallback) {
+  const value = readEnv(name, fallback);
+  try {
+    return ethers.getAddress(value);
+  } catch (error) {
+    throw new Error(`${name} is not a valid address: ${error.message}`);
+  }
+}
+
+const CONFIG = Object.freeze({
+  mode: String(readEnv("MODE", "scan")).trim().toLowerCase(),
+  rpcUrl: readEnv("POLYGON_WS_URL", readEnv("POLYGON_RPC_URL", DEFAULT_WSS)),
+  privateKey: process.env.PRIVATE_KEY,
+  router: addressFromEnv("QUICKSWAP_ROUTER", DEFAULT_ROUTER),
+  factory: addressFromEnv("QUICKSWAP_FACTORY", DEFAULT_FACTORY),
+  tradeAmount: readEnv("TRADE_AMOUNT", readEnv("FLASH_LOAN_AMOUNT", "12")),
+  minProfitAmount: readEnv("MIN_PROFIT_AMOUNT", "0.35"),
+  minPoolBase: readEnv("MIN_POOL_BASE", "15"),
+  estimatedGasCostAsset: readEnv("ESTIMATED_GAS_COST_ASSET", "0"),
+  slippageBps: parseBigIntEnv("SLIPPAGE_BPS", "35"),
+  maxTradeBps: parseBigIntEnv("MAX_TRADE_BPS", readEnv("MAX_BORROW_BPS", "4200")),
+  gasLimit: parsePositiveIntegerEnv("GAS_LIMIT", "520000"),
+  priorityFeeFloorGwei: readEnv("PRIORITY_FEE_FLOOR_GWEI", "60"),
+  priorityFeeMultiplier: parsePositiveNumberEnv("PRIORITY_FEE_MULTIPLIER", "2.5"),
+  maxCandidates: parsePositiveIntegerEnv("MAX_CANDIDATES", "32"),
+  maxPendingQueue: parsePositiveIntegerEnv("MAX_PENDING_QUEUE", "256"),
+  maxConcurrentEvaluations: parsePositiveIntegerEnv("MAX_CONCURRENT_EVALUATIONS", "4"),
+  autoDeploy: parseBoolean("AUTO_DEPLOY", false),
+  bundleRelayUrl: process.env.BUNDLE_RELAY_URL,
+  bundleRelayAuth: process.env.BUNDLE_RELAY_AUTH,
+  executorAddress: process.env.SANDWICH_CONTRACT_ADDRESS || process.env.FLASHBOT_CONTRACT_ADDRESS
+});
+
+if (!["scan", "paper", "execute"].includes(CONFIG.mode)) {
+  throw new Error("MODE must be one of: scan, paper, execute");
+}
+if (!CONFIG.rpcUrl || !/^wss?:\/\//i.test(CONFIG.rpcUrl)) {
+  throw new Error("Pending transaction scanning requires a websocket endpoint in POLYGON_WS_URL or POLYGON_RPC_URL");
+}
+if (CONFIG.slippageBps < 0n || CONFIG.slippageBps >= 10_000n) {
+  throw new Error("SLIPPAGE_BPS must be between 0 and 9999");
+}
+if (CONFIG.maxTradeBps <= 0n || CONFIG.maxTradeBps >= 10_000n) {
+  throw new Error("MAX_TRADE_BPS/MAX_BORROW_BPS must be between 1 and 9999");
+}
+if (CONFIG.mode === "execute" && !CONFIG.privateKey) {
+  throw new Error("PRIVATE_KEY is required when MODE=execute");
+}
+if (CONFIG.mode === "execute" && !CONFIG.bundleRelayUrl) {
+  throw new Error("BUNDLE_RELAY_URL is required when MODE=execute; public RPC submission cannot sandwich safely");
+}
 
 const ROUTER_ABI = [
   "function swapExactTokensForTokens(uint256 amountIn,uint256 amountOutMin,address[] calldata path,address to,uint256 deadline)"
@@ -60,32 +127,32 @@ const PAIR_ABI = [
   "function token0() external view returns (address)",
   "function token1() external view returns (address)"
 ];
-const ERC20_META_ABI = [
+const ERC20_ABI = [
+  "function allowance(address owner,address spender) external view returns (uint256)",
+  "function balanceOf(address account) external view returns (uint256)",
   "function decimals() external view returns (uint8)",
   "function symbol() external view returns (string)"
 ];
-
 const routerInterface = new ethers.Interface([
   "function swapExactTokensForTokens(uint256 amountIn,uint256 amountOutMin,address[] calldata path,address to,uint256 deadline)",
   "function swapExactTokensForETH(uint256 amountIn,uint256 amountOutMin,address[] calldata path,address to,uint256 deadline)",
   "function swapExactETHForTokens(uint256 amountOutMin,address[] calldata path,address to,uint256 deadline) payable"
 ]);
+const VERSION_ABI = ["function version() external view returns (uint256)"];
 
-const factoryContract = new ethers.Contract(QUICKSWAP_FACTORY, FACTORY_ABI, provider);
-
-const cachedPairs = new Map();
-const cachedTokenMeta = new Map();
-const observedVictims = new Set();
-let flashBotContract = null;
-let flashContractInfo = null;
-
-const FLASH_CONTRACT_SOURCE = `
+/**
+ * Owner-funded contract used by the bundle executor. It deliberately does
+ * not use a flash loan: a flash loan is repaid before the next transaction.
+ */
+const EXECUTOR_SOURCE = `
+// SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.21;
 
 interface IERC20 {
     function approve(address spender, uint256 value) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
     function transfer(address recipient, uint256 value) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 value) external returns (bool);
 }
 
 interface IUniswapV2Router02 {
@@ -98,150 +165,171 @@ interface IUniswapV2Router02 {
     ) external returns (uint256[] memory amounts);
 }
 
-interface IBalancerVault {
-    function flashLoan(
-        address recipient,
-        address[] calldata tokens,
-        uint256[] calldata amounts,
-        bytes calldata userData
-    ) external;
-}
-
-interface IBalancerFlashLoanRecipient {
-    function receiveFlashLoan(
-        address[] calldata tokens,
-        uint256[] calldata amounts,
-        uint256[] calldata feeAmounts,
-        bytes calldata userData
-    ) external;
-}
-
-contract PolygonSandwichFlashLoaner is IBalancerFlashLoanRecipient {
+contract PolygonSandwichExecutor {
+    uint256 public constant version = 1;
     address public immutable owner;
-    address public immutable balancerVault;
 
-    address private forwardRouter;
-    address private backwardRouter;
-    address[] private forwardPath;
-    address[] private backwardPath;
-    uint256 private forwardMinOut;
-    uint256 private backwardMinOut;
+    bool public active;
+    address public activeAsset;
+    uint256 public principal;
+    uint256 public frontOutput;
 
-    bool private inFlight;
+    address private backRouter;
+    address[] private backPath;
+    uint256 private backMinOut;
 
     error NotOwner();
     error InvalidConfig();
-    error RepayFailed();
+    error TokenOperationFailed();
+    error SwapFailed();
+    error Unprofitable();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
         _;
     }
 
-    constructor(address vault) {
-        if (vault == address(0)) revert InvalidConfig();
+    constructor() {
         owner = msg.sender;
-        balancerVault = vault;
     }
 
-    function initiateSandwich(
+    function startSandwich(
         address asset,
         uint256 amount,
-        address routerA,
-        address routerB,
+        address router,
         address[] calldata pathForward,
         address[] calldata pathBackward,
         uint256 minOutForward,
-        uint256 minOutBackward
+        uint256 minOutBackward,
+        uint256 deadline
     ) external onlyOwner {
-        if (inFlight || amount == 0 || routerA == address(0) || routerB == address(0)) revert InvalidConfig();
+        if (active || asset == address(0) || amount == 0 || router == address(0)) revert InvalidConfig();
         if (pathForward.length < 2 || pathBackward.length < 2) revert InvalidConfig();
-        if (pathForward[0] != asset || pathBackward[pathBackward.length - 1] != asset) revert InvalidConfig();
-        if (pathForward[pathForward.length - 1] != pathBackward[0]) revert InvalidConfig();
+        if (pathForward[0] != asset || pathForward[pathForward.length - 1] != pathBackward[0]) revert InvalidConfig();
+        if (pathBackward[pathBackward.length - 1] != asset) revert InvalidConfig();
+        if (deadline != 0 && deadline < block.timestamp) revert InvalidConfig();
 
-        forwardRouter = routerA;
-        backwardRouter = routerB;
-        forwardPath = pathForward;
-        backwardPath = pathBackward;
-        forwardMinOut = minOutForward;
-        backwardMinOut = minOutBackward;
+        active = true;
+        activeAsset = asset;
+        principal = amount;
+        backRouter = router;
+        backMinOut = minOutBackward;
+        delete backPath;
+        for (uint256 i = 0; i < pathBackward.length; i++) {
+            backPath.push(pathBackward[i]);
+        }
 
-        address[] memory tokens = new address[](1);
-        tokens[0] = asset;
-        uint256[] memory amounts = new uint256[](1);
-        amounts[0] = amount;
+        _callOptionalReturn(
+            asset,
+            abi.encodeWithSelector(IERC20.transferFrom.selector, owner, address(this), amount)
+        );
+        frontOutput = _swap(router, pathForward, amount, minOutForward, deadline);
+    }
 
-        inFlight = true;
-        IBalancerVault(balancerVault).flashLoan(address(this), tokens, amounts, "");
-        inFlight = false;
+    function finishSandwich(uint256 deadline) external onlyOwner {
+        if (!active || activeAsset == address(0) || principal == 0) revert InvalidConfig();
+        if (deadline != 0 && deadline < block.timestamp) revert InvalidConfig();
 
+        uint256 backOutput = _swap(backRouter, backPath, frontOutput, backMinOut, deadline);
+        if (backOutput < principal) revert Unprofitable();
+        _callOptionalReturn(activeAsset, abi.encodeWithSelector(IERC20.transfer.selector, owner, backOutput));
         _reset();
     }
 
-    function receiveFlashLoan(
-        address[] calldata tokens,
-        uint256[] calldata amounts,
-        uint256[] calldata feeAmounts,
-        bytes calldata
-    ) external override {
-        if (msg.sender != balancerVault) revert InvalidConfig();
-        if (tokens.length != 1 || amounts.length != 1 || feeAmounts.length != 1) revert InvalidConfig();
-        _process(tokens[0], amounts[0], feeAmounts[0]);
-    }
-
-    function _process(address asset, uint256 amount, uint256 fee) internal {
-        uint256 forwardOut = _swap(forwardRouter, forwardPath, amount, forwardMinOut);
-        uint256 backwardOut = _swap(backwardRouter, backwardPath, forwardOut, backwardMinOut);
-        uint256 totalOwed = amount + fee;
-        if (backwardOut < totalOwed) revert RepayFailed();
-
-        if (!IERC20(asset).transfer(balancerVault, totalOwed)) revert RepayFailed();
-        uint256 profit = backwardOut - totalOwed;
-        if (profit > 0) {
-            if (!IERC20(asset).transfer(owner, profit)) revert RepayFailed();
-        }
+    // Used to recover funds if a relay does not include the victim and the
+    // operator wants to unwind manually. The owner is responsible for choosing
+    // a safe destination token and path; this is not used by the bot itself.
+    function recover(address token, uint256 amount) external onlyOwner {
+        if (token == address(0)) revert InvalidConfig();
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20.transfer.selector, owner, amount));
     }
 
     function _swap(
         address router,
-        address[] storage path,
+        address[] memory path,
         uint256 amountIn,
-        uint256 minOut
+        uint256 minOut,
+        uint256 deadline
     ) internal returns (uint256) {
-        IERC20(path[0]).approve(router, 0);
-        IERC20(path[0]).approve(router, amountIn);
+        if (router == address(0) || path.length < 2 || amountIn == 0) revert InvalidConfig();
+        _callOptionalReturn(path[0], abi.encodeWithSelector(IERC20.approve.selector, router, 0));
+        _callOptionalReturn(path[0], abi.encodeWithSelector(IERC20.approve.selector, router, amountIn));
         uint256[] memory amounts = IUniswapV2Router02(router).swapExactTokensForTokens(
             amountIn,
             minOut,
             path,
             address(this),
-            block.timestamp
+            deadline == 0 ? block.timestamp : deadline
         );
+        if (amounts.length == 0) revert SwapFailed();
         return amounts[amounts.length - 1];
     }
 
-    function _reset() internal {
-        forwardRouter = address(0);
-        backwardRouter = address(0);
-        delete forwardPath;
-        delete backwardPath;
-        forwardMinOut = 0;
-        backwardMinOut = 0;
-        inFlight = false;
+    function _callOptionalReturn(address token, bytes memory data) private {
+        (bool success, bytes memory returndata) = token.call(data);
+        if (!success || (returndata.length != 0 && !abi.decode(returndata, (bool)))) {
+            revert TokenOperationFailed();
+        }
+    }
+
+    function _reset() private {
+        active = false;
+        activeAsset = address(0);
+        principal = 0;
+        frontOutput = 0;
+        backRouter = address(0);
+        backMinOut = 0;
+        delete backPath;
     }
 }
 `;
 
-const FLASH_CONTRACT_FILENAME = "PolygonSandwichFlashLoaner.sol";
-const FLASH_CONTRACT_NAME = "PolygonSandwichFlashLoaner";
+const EXECUTOR_FILENAME = "PolygonSandwichExecutor.sol";
+const EXECUTOR_NAME = "PolygonSandwichExecutor";
 let compiledContract = null;
+let runtime = null;
+
+const cachedPairs = new Map();
+const cachedTokenMeta = new Map();
+const observedVictims = new Map();
+const pendingQueue = [];
+const queuedHashes = new Set();
+let activeEvaluations = 0;
+let executorContract = null;
+let executorInfo = null;
+let executionInFlight = false;
+let nextBundleBlock = 0;
+
+function getRuntime({ requireWallet = false } = {}) {
+  if (runtime && (!requireWallet || runtime.wallet)) return runtime;
+  if (!runtime) {
+    const provider = new ethers.WebSocketProvider(CONFIG.rpcUrl, undefined, { timeout: 30_000 });
+    const wallet = CONFIG.privateKey ? new ethers.Wallet(CONFIG.privateKey, provider) : null;
+    runtime = {
+      provider,
+      wallet,
+      factory: new ethers.Contract(CONFIG.factory, FACTORY_ABI, provider)
+    };
+  }
+  if (requireWallet && !runtime.wallet) {
+    throw new Error("PRIVATE_KEY is required for execution");
+  }
+  return runtime;
+}
+
+function trimObservedVictims() {
+  const max = 20_000;
+  while (observedVictims.size > max) {
+    observedVictims.delete(observedVictims.keys().next().value);
+  }
+}
 
 function compileSandwichContract() {
   if (compiledContract) return compiledContract;
 
   const input = {
     language: "Solidity",
-    sources: { [FLASH_CONTRACT_FILENAME]: { content: FLASH_CONTRACT_SOURCE } },
+    sources: { [EXECUTOR_FILENAME]: { content: EXECUTOR_SOURCE } },
     settings: {
       optimizer: { enabled: true, runs: 200 },
       outputSelection: { "*": { "*": ["abi", "evm.bytecode"] } }
@@ -255,354 +343,624 @@ function compileSandwichContract() {
     throw new Error(`Solidity compilation failed: ${error.message}`);
   }
 
-  if (output.errors && output.errors.length) {
-    const fatal = output.errors.filter(e => e.severity === "error");
-    if (fatal.length) {
-      const message = fatal.map(e => e.formattedMessage || e.message).join("\n");
-      throw new Error(`Solidity compilation errors:\n${message}`);
-    }
-    output.errors.forEach(e => console.warn(e.formattedMessage || e.message));
+  const errors = output.errors || [];
+  const fatal = errors.filter(error => error.severity === "error");
+  if (fatal.length) {
+    throw new Error(`Solidity compilation errors:\n${fatal.map(error => error.formattedMessage || error.message).join("\n")}`);
   }
+  errors
+    .filter(error => error.severity !== "error")
+    .forEach(error => console.warn(error.formattedMessage || error.message));
 
-  const contract = output.contracts?.[FLASH_CONTRACT_FILENAME]?.[FLASH_CONTRACT_NAME];
+  const contract = output.contracts?.[EXECUTOR_FILENAME]?.[EXECUTOR_NAME];
   if (!contract || !contract.abi || !contract.evm?.bytecode?.object) {
-    throw new Error("Compiled contract artifact missing ABI or bytecode");
+    throw new Error("Compiled executor artifact is missing ABI or bytecode");
   }
-
   compiledContract = { abi: contract.abi, bytecode: contract.evm.bytecode.object };
   return compiledContract;
 }
 
-async function ensureFlashContract() {
+function readDeployments() {
+  if (!fs.existsSync(DEPLOYMENTS_FILE)) return {};
+  try {
+    const value = JSON.parse(fs.readFileSync(DEPLOYMENTS_FILE, "utf8"));
+    return value && typeof value === "object" ? value : {};
+  } catch (error) {
+    throw new Error(`Unable to parse ${DEPLOYMENTS_FILE}: ${error.message}`);
+  }
+}
+
+async function isCompatibleExecutor(address, provider) {
+  try {
+    const code = await provider.getCode(address);
+    if (!code || code === "0x") return false;
+    const version = await new ethers.Contract(address, VERSION_ABI, provider).version();
+    return BigInt(version) === 1n;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureExecutorContract() {
+  const { provider, wallet } = getRuntime({ requireWallet: true });
   const compiled = compileSandwichContract();
   const network = await provider.getNetwork();
+  if (network.chainId !== POLYGON_MAINNET_CHAIN_ID && !parseBoolean("ALLOW_NON_POLYGON", false)) {
+    throw new Error(`Connected to chain ${network.chainId}; set ALLOW_NON_POLYGON=true only for an intentional non-Polygon deployment`);
+  }
   const chainKey = String(network.chainId);
-  const deployments = fs.existsSync(DEPLOYMENTS_FILE)
-    ? JSON.parse(fs.readFileSync(DEPLOYMENTS_FILE, "utf8"))
-    : {};
 
-  const configuredAddress = process.env.FLASHBOT_CONTRACT_ADDRESS;
+  const configuredAddress = CONFIG.executorAddress;
   if (configuredAddress) {
-    const code = await provider.getCode(configuredAddress);
-    if (!code || code === "0x") {
-      throw new Error("FLASHBOT_CONTRACT_ADDRESS does not contain bytecode");
+    const address = addressFromEnv("SANDWICH_CONTRACT_ADDRESS/FLASHBOT_CONTRACT_ADDRESS", configuredAddress);
+    if (!(await isCompatibleExecutor(address, provider))) {
+      throw new Error(`${address} is not a compatible PolygonSandwichExecutor deployment`);
     }
-    return { address: ethers.getAddress(configuredAddress), abi: compiled.abi };
+    return { address, abi: compiled.abi };
   }
 
+  const deployments = readDeployments();
   const existing = deployments[chainKey];
-  if (existing && existing.address) {
-    const code = await provider.getCode(existing.address);
-    if (code && code !== "0x") {
-      return { address: ethers.getAddress(existing.address), abi: compiled.abi };
+  if (existing?.address) {
+    const existingAddress = addressFromEnv("deployment address", existing.address);
+    if (await isCompatibleExecutor(existingAddress, provider)) {
+      return { address: existingAddress, abi: compiled.abi };
     }
   }
 
-  console.info("Deploying PolygonSandwichFlashLoaner contract...");
+  if (!CONFIG.autoDeploy) {
+    throw new Error(
+      "No compatible executor configured. Set SANDWICH_CONTRACT_ADDRESS or AUTO_DEPLOY=true; " +
+      "deployment is disabled by default."
+    );
+  }
+
+  console.info("Deploying PolygonSandwichExecutor...");
   const factory = new ethers.ContractFactory(compiled.abi, compiled.bytecode, wallet);
-  const contract = await factory.deploy(DEFAULT_BALANCER_VAULT);
+  const contract = await factory.deploy({ gasLimit: CONFIG.gasLimit });
   await contract.waitForDeployment();
   const deployedAddress = await contract.getAddress();
-  deployments[chainKey] = {
-    address: deployedAddress,
-    deployedAt: new Date().toISOString()
-  };
-  fs.writeFileSync(DEPLOYMENTS_FILE, JSON.stringify(deployments, null, 2));
-  console.info(`PolygonSandwichFlashLoaner deployed at ${deployedAddress}`);
+  deployments[chainKey] = { address: deployedAddress, deployedAt: new Date().toISOString(), version: 1 };
+  fs.writeFileSync(DEPLOYMENTS_FILE, JSON.stringify(deployments, null, 2) + "\n", { mode: 0o600 });
+  console.info(`PolygonSandwichExecutor deployed at ${deployedAddress}`);
   return { address: deployedAddress, abi: compiled.abi };
 }
 
 async function getPair(tokenA, tokenB) {
-  const key = [tokenA, tokenB].sort().join(":");
+  const a = ethers.getAddress(tokenA);
+  const b = ethers.getAddress(tokenB);
+  if (a.toLowerCase() === b.toLowerCase()) return null;
+  const key = [a.toLowerCase(), b.toLowerCase()].sort().join(":");
   if (cachedPairs.has(key)) return cachedPairs.get(key);
-  const address = (await factoryContract.getPair(tokenA, tokenB))?.toLowerCase();
-  if (!address || address === ethers.ZeroAddress) return null;
-  cachedPairs.set(key, address);
-  return address;
+
+  const promise = getRuntime().factory.getPair(a, b)
+    .then(value => {
+      const address = String(value).toLowerCase();
+      return address === ZERO_ADDRESS.toLowerCase() ? null : address;
+    })
+    .catch(error => {
+      cachedPairs.delete(key);
+      throw error;
+    });
+  cachedPairs.set(key, promise);
+  return promise;
 }
 
 async function getReserves(pairAddress) {
-  const pair = new ethers.Contract(pairAddress, PAIR_ABI, provider);
-  const [reserve0, reserve1] = await pair.getReserves();
-  const token0 = (await pair.token0()).toLowerCase();
-  const token1 = (await pair.token1()).toLowerCase();
-  return { reserve0: BigInt(reserve0), reserve1: BigInt(reserve1), token0, token1 };
+  const address = ethers.getAddress(pairAddress);
+  const pair = new ethers.Contract(address, PAIR_ABI, getRuntime().provider);
+  const [reserves, token0Value, token1Value] = await Promise.all([
+    pair.getReserves(),
+    pair.token0(),
+    pair.token1()
+  ]);
+  return {
+    reserve0: BigInt(reserves[0]),
+    reserve1: BigInt(reserves[1]),
+    token0: String(token0Value).toLowerCase(),
+    token1: String(token1Value).toLowerCase()
+  };
 }
 
 async function getTokenMeta(address) {
-  const key = address.toLowerCase();
-  if (cachedTokenMeta.has(key)) return cachedTokenMeta.get(key);
-  const contract = new ethers.Contract(address, ERC20_META_ABI, provider);
-  let decimals = 18;
-  let symbol = address.slice(0, 6);
-  try { decimals = Number(await contract.decimals()); } catch (error) { console.warn(`decimals() failed for ${address}: ${error.message}`); }
-  try { symbol = await contract.symbol(); } catch (error) { console.warn(`symbol() failed for ${address}: ${error.message}`); }
-  const meta = { decimals, symbol };
-  cachedTokenMeta.set(key, meta);
+  const normalized = ethers.getAddress(address).toLowerCase();
+  if (cachedTokenMeta.has(normalized)) return cachedTokenMeta.get(normalized);
+  const token = new ethers.Contract(normalized, ERC20_ABI, getRuntime().provider);
+  let decimals;
+  try {
+    decimals = Number(await token.decimals());
+  } catch (error) {
+    throw new Error(`decimals() failed for ${normalized}: ${error.message}`);
+  }
+  if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 36) {
+    throw new Error(`Unsupported decimals value ${decimals} for ${normalized}`);
+  }
+
+  let symbol = normalized.slice(0, 8);
+  try {
+    const value = await token.symbol();
+    if (typeof value === "string" && value.length > 0 && value.length <= 32) symbol = value;
+  } catch (error) {
+    console.warn(`symbol() failed for ${normalized}: ${error.message}`);
+  }
+  const meta = Object.freeze({ decimals, symbol });
+  cachedTokenMeta.set(normalized, meta);
   return meta;
 }
 
-function getAmountOut(amountIn, reserveIn, reserveOut) {
-  if (amountIn <= 0n || reserveIn <= 0n || reserveOut <= 0n) return 0n;
-  const amountInWithFee = amountIn * 997n;
+function getAmountOut(amountIn, reserveIn, reserveOut, feeNumerator = 997n, feeDenominator = 1000n) {
+  if (amountIn <= 0n || reserveIn <= 0n || reserveOut <= 0n || feeNumerator <= 0n || feeDenominator <= 0n) return 0n;
+  const amountInWithFee = amountIn * feeNumerator;
   const numerator = amountInWithFee * reserveOut;
-  const denominator = reserveIn * 1000n + amountInWithFee;
-  if (denominator === 0n) return 0n;
-  return numerator / denominator;
+  const denominator = reserveIn * feeDenominator + amountInWithFee;
+  return denominator > 0n ? numerator / denominator : 0n;
 }
 
 function parseAssetUnits(value, decimals) {
+  if (typeof value !== "string" && typeof value !== "number") {
+    throw new Error(`Asset amount must be a string or number, received ${typeof value}`);
+  }
   try {
-    return ethers.parseUnits(value, decimals);
+    const result = ethers.parseUnits(String(value), decimals);
+    if (result < 0n) throw new Error("amount cannot be negative");
+    return result;
   } catch (error) {
-    throw new Error(`Failed to parse "${value}" with ${decimals} decimals: ${error.message}`);
+    throw new Error(`Failed to parse ${JSON.stringify(String(value))} with ${decimals} decimals: ${error.message}`);
   }
 }
 
 function clampBorrow(amount, reserveIn) {
-  const maxBorrow = (reserveIn * MAX_BORROW_BPS) / 10_000n;
-  if (maxBorrow === 0n) return 0n;
-  return amount > maxBorrow ? maxBorrow : amount;
+  if (amount <= 0n || reserveIn <= 0n) return 0n;
+  const maxTrade = (reserveIn * CONFIG.maxTradeBps) / 10_000n;
+  return maxTrade > 0n ? (amount > maxTrade ? maxTrade : amount) : 0n;
 }
 
 function generateBorrowCandidates(baseAmount, victimAmount, reserveIn) {
   const candidates = new Set();
   const push = amount => {
+    if (amount <= 0n) return;
     const clamped = clampBorrow(amount, reserveIn);
     if (clamped > 0n) candidates.add(clamped);
   };
 
   push(baseAmount);
-  push(baseAmount * 2n);
+  push(baseAmount / 2n);
   push((baseAmount * 3n) / 2n);
+  push(baseAmount * 2n);
+  push(victimAmount / 2n);
   push(victimAmount);
   push(victimAmount * 2n);
+  push(reserveIn / 10n);
+  push(reserveIn / 6n);
   push(reserveIn / 5n);
   push(reserveIn / 4n);
-  push(reserveIn / 6n);
 
-  return Array.from(candidates).sort((a, b) => (a > b ? -1 : a < b ? 1 : 0));
+  // A small geometric grid catches better sizes without making every pending
+  // transaction expensive to evaluate.
+  for (let i = 1n; i <= BigInt(CONFIG.maxCandidates); i++) {
+    push((reserveIn * i) / BigInt(CONFIG.maxCandidates + 1));
+  }
+  return Array.from(candidates).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).slice(0, CONFIG.maxCandidates);
 }
 
-function simulateOpportunity(borrowAmount, victimAmount, reserveIn, reserveOut) {
-  if (borrowAmount === 0n) return null;
-  const flashLoanFee = (borrowAmount * BALANCER_FEE_BPS) / 10_000n;
+function simulateOpportunity(
+  tradeAmount,
+  victimAmount,
+  reserveIn,
+  reserveOut,
+  { slippageBps = CONFIG.slippageBps, estimatedGasCostAsset = 0n } = {}
+) {
+  if (tradeAmount <= 0n || victimAmount <= 0n || reserveIn <= 0n || reserveOut <= 0n) return null;
+  if (estimatedGasCostAsset < 0n || slippageBps < 0n || slippageBps >= 10_000n) return null;
 
-  const frontOut = getAmountOut(borrowAmount, reserveIn, reserveOut);
-  if (frontOut === 0n) return null;
+  const frontOut = getAmountOut(tradeAmount, reserveIn, reserveOut);
+  if (frontOut <= 0n || frontOut >= reserveOut) return null;
 
-  const reserveInAfterFront = reserveIn + borrowAmount;
+  const reserveInAfterFront = reserveIn + tradeAmount;
   const reserveOutAfterFront = reserveOut - frontOut;
-  if (reserveOutAfterFront <= 0n) return null;
-
   const victimOut = getAmountOut(victimAmount, reserveInAfterFront, reserveOutAfterFront);
-  if (victimOut === 0n) return null;
+  if (victimOut <= 0n || victimOut >= reserveOutAfterFront) return null;
 
   const reserveInAfterVictim = reserveInAfterFront + victimAmount;
   const reserveOutAfterVictim = reserveOutAfterFront - victimOut;
-  if (reserveOutAfterVictim <= 0n) return null;
-
   const backOut = getAmountOut(frontOut, reserveOutAfterVictim, reserveInAfterVictim);
-  if (backOut === 0n) return null;
+  if (backOut <= 0n) return null;
 
-  const netProfit = backOut - borrowAmount - flashLoanFee;
+  const grossProfit = backOut > tradeAmount ? backOut - tradeAmount : 0n;
+  const totalCosts = estimatedGasCostAsset;
+  const netProfit = grossProfit > totalCosts ? grossProfit - totalCosts : 0n;
   if (netProfit <= 0n) return null;
 
-  const minFrontOut = (frontOut * (10_000n - SLIPPAGE_BPS)) / 10_000n;
-  const minBackOut = (backOut * (10_000n - SLIPPAGE_BPS)) / 10_000n;
+  const minFrontOut = (frontOut * (10_000n - slippageBps)) / 10_000n;
+  // Never allow the back-run to complete below principal plus the configured
+  // gas reserve. Otherwise a "profitable" simulation could lose money.
+  const slippageBackOut = (backOut * (10_000n - slippageBps)) / 10_000n;
+  const protectedBackOut = tradeAmount + estimatedGasCostAsset;
+  const minBackOut = slippageBackOut > protectedBackOut ? slippageBackOut : protectedBackOut;
+  if (minBackOut > backOut) return null;
 
   return {
-    borrowAmount,
-    flashLoanFee,
+    tradeAmount,
+    borrowAmount: tradeAmount, // backwards-compatible field name for callers
+    victimAmount,
     frontOut,
     victimOut,
     backOut,
+    grossProfit,
+    estimatedGasCostAsset,
+    totalCosts,
     netProfit,
     minFrontOut,
     minBackOut
   };
 }
 
-async function evaluateSandwich(tx, parsedTx) {
-  if (!parsedTx.args || parsedTx.args.length < 4) return null;
-  const path = parsedTx.args.path.map(addr => addr.toLowerCase());
-  if (path.length !== 2) return null; // restrict to single pair for accurate reserve math
+async function latestBlockTimestamp(provider) {
+  try {
+    const block = await provider.getBlock("latest");
+    return block?.timestamp ?? Math.floor(Date.now() / 1000);
+  } catch {
+    return Math.floor(Date.now() / 1000);
+  }
+}
 
+async function evaluateSandwich(tx, parsedTx) {
+  if (!tx || !parsedTx?.args || parsedTx.name !== "swapExactTokensForTokens") return null;
+  if (!tx.to || tx.to.toLowerCase() !== CONFIG.router.toLowerCase()) return null;
+  if (tx.value !== undefined && tx.value !== null && BigInt(tx.value) !== 0n) return null;
+
+  const args = parsedTx.args;
+  if (args.length < 5) return null;
+  const path = Array.from(args[2], address => String(address).toLowerCase());
+  if (path.length !== 2 || path[0] === path[1]) return null;
   const [tokenIn, tokenOut] = path;
+
+  const deadline = BigInt(args[4]);
+  if (deadline !== 0n && deadline < BigInt(await latestBlockTimestamp(getRuntime().provider))) return null;
+  const victimIn = BigInt(args[0]);
+  const victimMinOut = BigInt(args[1]);
+  if (victimIn <= 0n) return null;
+
   const pairAddress = await getPair(tokenIn, tokenOut);
   if (!pairAddress) return null;
-
   const { reserve0, reserve1, token0, token1 } = await getReserves(pairAddress);
+  if (tokenIn !== token0 && tokenIn !== token1) return null;
   const reserveIn = token0 === tokenIn ? reserve0 : reserve1;
   const reserveOut = token0 === tokenIn ? reserve1 : reserve0;
-  if (reserveIn === 0n || reserveOut === 0n) return null;
+  if (reserveIn <= 0n || reserveOut <= 0n) return null;
 
-  const victimIn = BigInt(parsedTx.args.amountIn.toString());
-  if (victimIn === 0n) return null;
+  const [tokenInMeta, tokenOutMeta] = await Promise.all([getTokenMeta(tokenIn), getTokenMeta(tokenOut)]);
+  if (reserveIn < parseAssetUnits(CONFIG.minPoolBase, tokenInMeta.decimals)) return null;
 
-  const tokenInMeta = await getTokenMeta(tokenIn);
-  const tokenOutMeta = await getTokenMeta(tokenOut);
+  const baseTrade = clampBorrow(parseAssetUnits(CONFIG.tradeAmount, tokenInMeta.decimals), reserveIn);
+  if (baseTrade <= 0n) return null;
+  const estimatedGasCostAsset = parseAssetUnits(CONFIG.estimatedGasCostAsset, tokenInMeta.decimals);
+  const candidates = generateBorrowCandidates(baseTrade, victimIn, reserveIn);
 
-  const minReserve = parseAssetUnits(MIN_POOL_BASE, tokenInMeta.decimals);
-  if (reserveIn < minReserve) return null;
-
-  const baseBorrow = clampBorrow(parseAssetUnits(FLASH_LOAN_AMOUNT, tokenInMeta.decimals), reserveIn);
-  if (baseBorrow === 0n) return null;
-
-  const candidates = generateBorrowCandidates(baseBorrow, victimIn, reserveIn);
   let best = null;
-
   for (const candidate of candidates) {
-    const simulation = simulateOpportunity(candidate, victimIn, reserveIn, reserveOut);
-    if (!simulation) continue;
-    if (!best || simulation.netProfit > best.netProfit) {
-      best = simulation;
-    }
+    const simulation = simulateOpportunity(candidate, victimIn, reserveIn, reserveOut, {
+      estimatedGasCostAsset,
+      slippageBps: CONFIG.slippageBps
+    });
+    if (!simulation || simulation.victimOut < victimMinOut) continue;
+    if (!best || simulation.netProfit > best.netProfit) best = simulation;
   }
-
   if (!best) return null;
 
-  const minProfit = parseAssetUnits(MIN_PROFIT_AMOUNT, tokenInMeta.decimals);
+  const minProfit = parseAssetUnits(CONFIG.minProfitAmount, tokenInMeta.decimals);
   if (best.netProfit < minProfit) return null;
-
-  const borrowShareBps = (best.borrowAmount * 10_000n) / reserveIn;
 
   return {
     asset: tokenIn,
     assetMeta: tokenInMeta,
+    outputAsset: tokenOut,
     outputMeta: tokenOutMeta,
     pathForward: [tokenIn, tokenOut],
     pathBackward: [tokenOut, tokenIn],
     pairAddress,
     victimIn,
-    borrowAmount: best.borrowAmount,
+    victimMinOut,
+    victimDeadline: deadline,
+    tradeAmount: best.tradeAmount,
+    borrowAmount: best.tradeAmount,
     frontOut: best.frontOut,
+    victimOut: best.victimOut,
     backOut: best.backOut,
     minFrontOut: best.minFrontOut,
     minBackOut: best.minBackOut,
+    grossProfit: best.grossProfit,
+    estimatedGasCostAsset: best.estimatedGasCostAsset,
     netProfit: best.netProfit,
-    flashLoanFee: best.flashLoanFee,
-    borrowShareBps,
-    tx
+    borrowShareBps: (best.tradeAmount * 10_000n) / reserveIn,
+    tx,
+    pairReserves: { reserveIn, reserveOut }
   };
 }
 
-async function buildAndSend(opportunity, gasOverrides) {
-  if (!flashBotContract) {
-    throw new Error("Flash-loan contract not initialised");
+function multiplyCeiling(value, multiplier) {
+  const scale = 1_000_000n;
+  const scaled = BigInt(Math.ceil(multiplier * Number(scale)));
+  return (value * scaled + scale - 1n) / scale;
+}
+
+async function getFeeOverrides() {
+  const { provider } = getRuntime();
+  if (process.env.FIXED_GAS_PRICE_GWEI) {
+    const gasPrice = ethers.parseUnits(process.env.FIXED_GAS_PRICE_GWEI, 9);
+    if (gasPrice <= 0n) throw new Error("FIXED_GAS_PRICE_GWEI must be positive");
+    return { gasPrice };
   }
-  return flashBotContract.initiateSandwich(
+
+  const feeData = await provider.getFeeData();
+  const floor = ethers.parseUnits(CONFIG.priorityFeeFloorGwei, 9);
+  const observedPriority = feeData.maxPriorityFeePerGas ?? feeData.gasPrice ?? floor;
+  const priority = observedPriority > floor
+    ? multiplyCeiling(observedPriority, CONFIG.priorityFeeMultiplier)
+    : floor;
+  const base = feeData.lastBaseFeePerGas;
+
+  if (base === null || base === undefined) {
+    const gasPrice = feeData.gasPrice && feeData.gasPrice > priority ? feeData.gasPrice : priority;
+    return { gasPrice };
+  }
+  return {
+    maxFeePerGas: base * 2n + priority,
+    maxPriorityFeePerGas: priority
+  };
+}
+
+function formatAmount(amount, decimals) {
+  return ethers.formatUnits(amount, decimals);
+}
+
+function logOpportunity(opportunity, gasOverrides, prefix = "Opportunity") {
+  const gasText = gasOverrides
+    ? gasOverrides.gasPrice
+      ? `${ethers.formatUnits(gasOverrides.gasPrice, 9)} gwei`
+      : `${ethers.formatUnits(gasOverrides.maxPriorityFeePerGas, 9)} gwei prio / ${ethers.formatUnits(gasOverrides.maxFeePerGas, 9)} gwei max`
+    : "not priced";
+  console.info(
+    `${prefix} [${opportunity.assetMeta.symbol}/${opportunity.outputMeta.symbol}] ` +
+      `victim=${formatAmount(opportunity.victimIn, opportunity.assetMeta.decimals)} ` +
+      `trade=${formatAmount(opportunity.tradeAmount, opportunity.assetMeta.decimals)} ` +
+      `frontOut=${formatAmount(opportunity.frontOut, opportunity.outputMeta.decimals)} ` +
+      `gross=${formatAmount(opportunity.grossProfit, opportunity.assetMeta.decimals)} ` +
+      `gasReserve=${formatAmount(opportunity.estimatedGasCostAsset, opportunity.assetMeta.decimals)} ` +
+      `net=${formatAmount(opportunity.netProfit, opportunity.assetMeta.decimals)} ` +
+      `share=${(Number(opportunity.borrowShareBps) / 100).toFixed(2)}% gas=${gasText}`
+  );
+}
+
+function serializeVictimTransaction(tx) {
+  if (tx.serialized && tx.serialized !== "0x") return tx.serialized;
+  if (!tx.signature) throw new Error("Pending victim transaction has no signature");
+  const txLike = {
+    type: tx.type ?? 0,
+    to: tx.to,
+    nonce: tx.nonce,
+    gasLimit: tx.gasLimit,
+    gasPrice: tx.gasPrice ?? undefined,
+    maxFeePerGas: tx.maxFeePerGas ?? undefined,
+    maxPriorityFeePerGas: tx.maxPriorityFeePerGas ?? undefined,
+    value: tx.value ?? 0n,
+    data: tx.data ?? "0x",
+    chainId: tx.chainId,
+    accessList: tx.accessList ?? undefined,
+    blobVersionedHashes: tx.blobVersionedHashes ?? undefined,
+    signature: tx.signature
+  };
+  return ethers.Transaction.from(txLike).serialized;
+}
+
+async function assertExecutionFunding(opportunity) {
+  const { provider, wallet } = getRuntime({ requireWallet: true });
+  if (!executorContract) throw new Error("Executor contract not initialised");
+  const token = new ethers.Contract(opportunity.asset, ERC20_ABI, provider);
+  const [balance, allowance] = await Promise.all([
+    token.balanceOf(wallet.address),
+    token.allowance(wallet.address, executorInfo.address)
+  ]);
+  if (BigInt(balance) < opportunity.tradeAmount) {
+    throw new Error(`Insufficient ${opportunity.assetMeta.symbol} balance for bundle trade`);
+  }
+  if (BigInt(allowance) < opportunity.tradeAmount) {
+    throw new Error(
+      `Insufficient ${opportunity.assetMeta.symbol} allowance. Approve ${executorInfo.address} before enabling execution.`
+    );
+  }
+}
+
+async function sendBundle(rawTransactions, targetBlock) {
+  if (!CONFIG.bundleRelayUrl) throw new Error("BUNDLE_RELAY_URL is not configured");
+  const headers = { "content-type": "application/json" };
+  if (CONFIG.bundleRelayAuth) headers.authorization = CONFIG.bundleRelayAuth;
+  const body = {
+    jsonrpc: "2.0",
+    id: Date.now(),
+    method: "eth_sendBundle",
+    params: [{ txs: rawTransactions, blockNumber: ethers.toBeHex(targetBlock) }]
+  };
+  const response = await fetch(CONFIG.bundleRelayUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body)
+  });
+  const text = await response.text();
+  let result;
+  try {
+    result = JSON.parse(text);
+  } catch {
+    throw new Error(`Bundle relay returned non-JSON HTTP ${response.status}: ${text.slice(0, 300)}`);
+  }
+  if (!response.ok || result.error) {
+    throw new Error(`Bundle relay rejected request: ${JSON.stringify(result.error || result)}`);
+  }
+  return result.result;
+}
+
+async function buildAndSend(opportunity, gasOverrides) {
+  if (!executorContract || !executorInfo) throw new Error("Executor contract not initialised");
+  await assertExecutionFunding(opportunity);
+  const { provider, wallet } = getRuntime({ requireWallet: true });
+  const latestBlock = await provider.getBlockNumber();
+  const network = await provider.getNetwork();
+  const latestNonce = await provider.getTransactionCount(wallet.address, "latest");
+  const pendingNonce = await wallet.getNonce("pending");
+  if (pendingNonce !== latestNonce) {
+    throw new Error("Executor wallet has pending transactions; refusing to create a bundle with a nonce gap");
+  }
+  const nonce = latestNonce;
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  const defaultDeadline = now + 60n;
+  let deadline = Number(defaultDeadline);
+  if (opportunity.victimDeadline > 0n && opportunity.victimDeadline < defaultDeadline) {
+    if (opportunity.victimDeadline <= now) throw new Error("Victim deadline expired while building bundle");
+    deadline = Number(opportunity.victimDeadline);
+  }
+
+  const start = await executorContract.startSandwich.populateTransaction(
     opportunity.asset,
-    opportunity.borrowAmount,
-    QUICKSWAP_ROUTER,
-    QUICKSWAP_ROUTER,
+    opportunity.tradeAmount,
+    CONFIG.router,
     opportunity.pathForward,
     opportunity.pathBackward,
     opportunity.minFrontOut,
     opportunity.minBackOut,
-    { gasLimit: GAS_LIMIT, ...gasOverrides }
+    deadline
   );
+  const finish = await executorContract.finishSandwich.populateTransaction(deadline);
+  const feeFields = { ...gasOverrides };
+  const startUnsigned = await wallet.populateTransaction({
+    ...start,
+    ...feeFields,
+    chainId: network.chainId,
+    nonce,
+    gasLimit: CONFIG.gasLimit
+  });
+  const finishUnsigned = await wallet.populateTransaction({
+    ...finish,
+    ...feeFields,
+    chainId: network.chainId,
+    nonce: nonce + 1,
+    gasLimit: CONFIG.gasLimit
+  });
+  const [startRaw, victimRaw, finishRaw] = await Promise.all([
+    wallet.signTransaction(startUnsigned),
+    Promise.resolve(serializeVictimTransaction(opportunity.tx)),
+    wallet.signTransaction(finishUnsigned)
+  ]);
+  const bundleId = await sendBundle([startRaw, victimRaw, finishRaw], latestBlock + 1);
+  return { bundleId, targetBlock: latestBlock + 1, startRaw, finishRaw };
 }
 
-async function getFeeOverrides() {
-  if (process.env.FIXED_GAS_PRICE_GWEI) {
-    return { gasPrice: ethers.parseUnits(process.env.FIXED_GAS_PRICE_GWEI, 9) };
-  }
+async function processPendingTx(txHash) {
+  if (observedVictims.has(txHash)) return;
+  observedVictims.set(txHash, Date.now());
+  trimObservedVictims();
 
-  const feeData = await provider.getFeeData();
-  const floor = ethers.parseUnits(PRIORITY_FEE_FLOOR_GWEI, 9);
-  const priority = (feeData.maxPriorityFeePerGas ?? 0n) > floor ? feeData.maxPriorityFeePerGas : floor;
+  const { provider, wallet } = getRuntime();
+  const tx = await provider.getTransaction(txHash);
+  if (!tx || !tx.to || tx.to.toLowerCase() !== CONFIG.router.toLowerCase()) return;
+  if (wallet && tx.from && tx.from.toLowerCase() === wallet.address.toLowerCase()) return;
 
-  // Robustly calculate maxFeePerGas using the last base fee.
-  // A common strategy is 2 * base_fee + priority_fee.
-  const maxFee = ((feeData.lastBaseFeePerGas ?? priority) * 2n) + priority;
-
-  return { maxFeePerGas: maxFee, maxPriorityFeePerGas: priority };
-}
-
-async function logOpportunity(opportunity, gasOverrides) {
-  const profit = Number(ethers.formatUnits(opportunity.netProfit, opportunity.assetMeta.decimals));
-  const borrow = Number(ethers.formatUnits(opportunity.borrowAmount, opportunity.assetMeta.decimals));
-  const victim = Number(ethers.formatUnits(opportunity.victimIn, opportunity.assetMeta.decimals));
-  const front = Number(ethers.formatUnits(opportunity.frontOut, opportunity.outputMeta.decimals));
-  const fee = Number(ethers.formatUnits(opportunity.flashLoanFee, opportunity.assetMeta.decimals));
-
-  const gasText = gasOverrides.gasPrice
-    ? `${ethers.formatUnits(gasOverrides.gasPrice, 9)} gwei`
-    : `${ethers.formatUnits(gasOverrides.maxPriorityFeePerGas, 9)} gwei prio / ${ethers.formatUnits(gasOverrides.maxFeePerGas, 9)} gwei max`;
-
-  console.info(
-    `[${opportunity.assetMeta.symbol}/${opportunity.outputMeta.symbol}] victim=${victim.toFixed(6)} borrow=${borrow.toFixed(6)} frontOut=${front.toFixed(6)} ` +
-      `netProfit=${profit.toFixed(6)} fee=${fee.toFixed(6)} share=${(Number(opportunity.borrowShareBps) / 100).toFixed(2)}% gas=${gasText}`
-  );
-}
-
-async function handlePendingTx(txHash) {
+  let parsed;
   try {
-    if (!flashBotContract) return;
-    const tx = await provider.getTransaction(txHash);
-    if (!tx || !tx.to || tx.to.toLowerCase() !== QUICKSWAP_ROUTER) return;
-    if (!tx.data || observedVictims.has(txHash)) return;
+    parsed = routerInterface.parseTransaction({ data: tx.data, value: tx.value });
+  } catch {
+    return;
+  }
+  if (!parsed || parsed.name !== "swapExactTokensForTokens") return;
 
-    let parsed;
-    try {
-      parsed = routerInterface.parseTransaction({ data: tx.data, value: tx.value });
-    } catch {
-      return;
-    }
+  const opportunity = await evaluateSandwich(tx, parsed);
+  if (!opportunity) return;
+  if (CONFIG.mode !== "execute") {
+    logOpportunity(opportunity, null, "Scan candidate");
+    return;
+  }
+  if (executionInFlight) return;
+  const head = await provider.getBlockNumber();
+  if (head + 1 <= nextBundleBlock) return;
 
-    if (!parsed || parsed.name !== "swapExactTokensForTokens") return;
-
-    const opportunity = await evaluateSandwich(tx, parsed);
-    if (!opportunity) return;
-
-    observedVictims.add(txHash);
-    if (observedVictims.size > 20_000) {
-      observedVictims.clear();
-    }
-
-    const feeOverrides = await getFeeOverrides();
-    await logOpportunity(opportunity, feeOverrides);
-
-    const response = await buildAndSend(opportunity, feeOverrides);
-    console.info(`Submitted sandwich tx ${response.hash}`);
-    await response.wait();
-    console.info(`Sandwich confirmed ${response.hash}`);
-  } catch (error) {
-    console.error("Error processing pending transaction", error);
+  executionInFlight = true;
+  try {
+    const gasOverrides = await getFeeOverrides();
+    logOpportunity(opportunity, gasOverrides, "Bundle candidate");
+    const response = await buildAndSend(opportunity, gasOverrides);
+    nextBundleBlock = response.targetBlock;
+    console.info(`Submitted private bundle ${response.bundleId || "(relay accepted)"} for block ${response.targetBlock}`);
+  } finally {
+    executionInFlight = false;
   }
 }
 
-async function initialiseFlashLoanContract() {
-  flashContractInfo = await ensureFlashContract();
-  flashBotContract = new ethers.Contract(flashContractInfo.address, flashContractInfo.abi, wallet);
-  const owner = await flashBotContract.owner();
-  if (owner.toLowerCase() !== wallet.address.toLowerCase()) {
-    throw new Error(`Flash-loan contract owner ${owner} does not match bot wallet ${wallet.address}`);
+async function drainPendingQueue() {
+  while (activeEvaluations < CONFIG.maxConcurrentEvaluations && pendingQueue.length > 0) {
+    const txHash = pendingQueue.shift();
+    queuedHashes.delete(txHash);
+    activeEvaluations += 1;
+    processPendingTx(txHash)
+      .catch(error => console.error(`Error processing pending transaction ${txHash}:`, error.message))
+      .finally(() => {
+        activeEvaluations -= 1;
+        void drainPendingQueue();
+      });
   }
-  console.info(`Using flash-loan contract ${flashContractInfo.address}`);
+}
+
+function handlePendingTx(txHash) {
+  if (typeof txHash !== "string" || queuedHashes.has(txHash) || observedVictims.has(txHash)) return;
+  if (pendingQueue.length >= CONFIG.maxPendingQueue) pendingQueue.shift();
+  queuedHashes.add(txHash);
+  pendingQueue.push(txHash);
+  void drainPendingQueue();
+}
+
+async function initialiseExecutorContract() {
+  executorInfo = await ensureExecutorContract();
+  executorContract = new ethers.Contract(executorInfo.address, executorInfo.abi, getRuntime({ requireWallet: true }).wallet);
+  const owner = await executorContract.owner();
+  const walletAddress = getRuntime({ requireWallet: true }).wallet.address;
+  if (owner.toLowerCase() !== walletAddress.toLowerCase()) {
+    throw new Error(`Executor owner ${owner} does not match bot wallet ${walletAddress}`);
+  }
+  console.info(`Using PolygonSandwichExecutor ${executorInfo.address}`);
 }
 
 async function main() {
-  console.info("Polygon sandwich bot initialising...");
-  console.info(`Monitoring QuickSwap router ${QUICKSWAP_ROUTER}`);
-  await initialiseFlashLoanContract();
+  const { provider } = getRuntime({ requireWallet: CONFIG.mode === "execute" });
+  const network = await provider.getNetwork();
+  if (network.chainId !== POLYGON_MAINNET_CHAIN_ID) {
+    console.warn(`Connected to chain ${network.chainId}; this process is intended for Polygon mainnet (137).`);
+  }
+  if (CONFIG.mode === "execute") await initialiseExecutorContract();
+  console.info(`${CONFIG.mode === "execute" ? "Bundle executor" : "Mempool scanner"} monitoring QuickSwap router ${CONFIG.router}`);
+  provider.on("error", error => console.error("WebSocket provider error:", error.message));
   provider.on("pending", handlePendingTx);
-  console.info("Mempool listener attached – awaiting profitable swaps.");
+  console.info("Pending transaction listener attached.");
 }
 
 if (require.main === module) {
   main().catch(error => {
-    console.error("Fatal startup error", error);
-    process.exit(1);
+    console.error("Fatal startup error:", error);
+    process.exitCode = 1;
   });
 }
 
 module.exports = {
+  CONFIG,
   compileSandwichContract,
-  ensureFlashContract,
+  ensureExecutorContract,
+  ensureFlashContract: ensureExecutorContract,
   evaluateSandwich,
   getAmountOut,
+  parseAssetUnits,
+  clampBorrow,
+  generateBorrowCandidates,
+  simulateOpportunity,
+  serializeVictimTransaction,
   getReserves,
-  getPair
+  getPair,
+  getFeeOverrides,
+  handlePendingTx
 };
